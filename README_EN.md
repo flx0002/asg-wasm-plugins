@@ -16,6 +16,11 @@ The AI Context Management plugin manages the context window for LLM conversation
 - **Token threshold trigger** (trigger compression by token count)
 - **Overlap window** (preserve messages at compaction boundaries for context continuity)
 - **Customizable summary template**
+- **Turn-pair integrity** (keep user-assistant pairs as atomic units)
+- **Instruction/message pinning** (pin messages by role to prevent eviction)
+- **Tool message awareness** (handle tool_calls/tool_call_id/function_call/name)
+- **Context caching hints** (inspired by ADK ContextCacheConfig)
+- **Response token usage tracking** (extract token metadata from model responses)
 - **Scoped state management** (session/user/app/temp prefixes, inspired by ADK State management)
 - Session memory injection
 
@@ -60,6 +65,31 @@ Default summary template:
 |----------------|-----------------|------|-----|----------------------------------|
 | `state_scope` | string | optional | "session" | State scope prefix: session/user/app/temp |
 | `state_header_prefix` | string | optional | "x-context-state" | Prefix for state-related request headers |
+
+### Turn-pair Integrity Configuration
+
+| Name | Data Type | Requirement | Default Value | Description |
+|----------------|-----------------|------|-----|----------------------------------|
+| `preserve_turn_pairs` | bool | optional | false | Keep user-assistant message pairs as atomic units during context management |
+
+### Instruction/Message Pinning Configuration
+
+| Name | Data Type | Requirement | Default Value | Description |
+|----------------|-----------------|------|-----|----------------------------------|
+| `pinned_message_roles` | []string | optional | none | List of message roles to pin and never evict (e.g., ["tool", "function"]) |
+
+### Context Caching Hints Configuration (Google ADK ContextCacheConfig Style)
+
+| Name | Data Type | Requirement | Default Value | Description |
+|----------------|-----------------|------|-----|----------------------------------|
+| `cache_system_prompt` | bool | optional | false | Enable system prompt caching hints (adds response headers) |
+| `cache_min_tokens` | int | optional | 0 | Minimum token count to trigger cache hints |
+
+### Response Token Tracking Configuration
+
+| Name | Data Type | Requirement | Default Value | Description |
+|----------------|-----------------|------|-----|----------------------------------|
+| `track_token_usage` | bool | optional | false | Extract token usage info from model responses and add to response headers |
 
 ## Configuration Example
 
@@ -118,6 +148,25 @@ state_scope: "user"
 state_header_prefix: "x-context-state"
 inject_memory: true
 memory_key: "x-session-memory"
+```
+
+### Turn-pair Integrity + Tool Message Pinning
+
+```yaml
+summarize_strategy: compaction
+compaction_interval: 3
+overlap_size: 2
+preserve_turn_pairs: true
+pinned_message_roles: ["tool", "function"]
+preserve_system_message: true
+```
+
+### Context Caching Hints + Token Tracking
+
+```yaml
+cache_system_prompt: true
+cache_min_tokens: 100
+track_token_usage: true
 ```
 
 ## How It Works
@@ -186,6 +235,43 @@ Inspired by Google ADK's State management system, supports four scope prefixes:
 
 State is passed through request headers: `{state_header_prefix}-{scope}`
 
+### Turn-pair Integrity
+
+When `preserve_turn_pairs: true` is enabled, context management checks message pair integrity after truncation/compaction:
+- User-assistant message pairs are treated as atomic units
+- Orphaned assistant messages (without corresponding user) are removed
+- Trailing user messages (latest query) are preserved
+- Tool/function/system messages are independently preserved
+
+```
+After truncation: [assistant2(orphaned), user3, assistant3, user4]
+After turn-pair fix: [user3, assistant3, user4]
+```
+
+### Instruction/Message Pinning
+
+When `pinned_message_roles: ["tool", "function"]` is configured, messages with pinned roles are never evicted during context management:
+
+```
+Original: [system, user1, assistant1, tool_result, user2, assistant2, user3]
+max_messages: 3
+
+Result: [system, tool_result(pinned), assistant2, user3]
+```
+
+### Context Caching Hints
+
+When `cache_system_prompt: true` is enabled and system prompt tokens ≥ `cache_min_tokens`, caching hints are added to response headers:
+- `x-context-cache-status: eligible` - Marks as cacheable
+- `x-context-cache-tokens: <token_count>` - System prompt token count
+
+### Response Token Tracking
+
+When `track_token_usage: true` is enabled, token usage info is extracted from model responses:
+- `x-context-prompt-tokens` - Input token count
+- `x-context-completion-tokens` - Output token count
+- `x-context-total-tokens` - Total token count
+
 ## Request Example
 
 ### Basic Usage
@@ -231,6 +317,8 @@ With `summarize_strategy: compaction, compaction_interval: 3, overlap_size: 2`, 
 4. **Performance Optimization**: Reduce processing time and response latency
 5. **Long Conversation Support**: Support extended conversations through context compression without losing key information
 6. **Multi-scope State Management**: Manage state with different lifecycles via session/user/app/temp scopes
+7. **Tool Call Scenarios**: Properly handle complex conversations with tool_calls/function_call messages
+8. **Token Cost Monitoring**: Monitor API call costs through response token tracking
 
 ## Notes
 
@@ -240,3 +328,6 @@ With `summarize_strategy: compaction, compaction_interval: 3, overlap_size: 2`, 
 4. Memory injection requires a session management service
 5. Context compression uses extractive summarization (not LLM-generated), suitable for fast gateway-layer processing
 6. Recommended `overlap_size` of 1-3 to balance context continuity and compression efficiency
+7. Enabling `preserve_turn_pairs` may result in slightly fewer messages than `max_messages`
+8. Messages with `pinned_message_roles` are not counted towards `max_messages` limit
+9. Context caching hints require upstream service support for actual caching implementation

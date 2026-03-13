@@ -16,6 +16,11 @@ AI 上下文管理插件，用于管理 LLM 对话的上下文窗口，参考 Go
 - **Token 阈值触发**（按 Token 数量触发压缩）
 - **重叠窗口**（压缩边界处保留消息以维持上下文连续性）
 - **可自定义摘要模板**
+- **对话轮次完整性保护**（user-assistant 配对原子处理）
+- **指令/消息固定**（按角色固定不被淘汰的消息）
+- **工具消息感知**（tool_calls/tool_call_id/function_call/name）
+- **上下文缓存提示**（参考 ADK ContextCacheConfig）
+- **响应 Token 使用追踪**（从模型响应提取 Token 元数据）
 - **作用域状态管理**（session/user/app/temp 前缀，参考 ADK State 管理）
 - 会话记忆注入
 
@@ -60,6 +65,31 @@ AI 上下文管理插件，用于管理 LLM 对话的上下文窗口，参考 Go
 |----------------|-----------------|------|-----|----------------------------------|
 | `state_scope` | string | 选填 | "session" | 状态作用域前缀：session/user/app/temp |
 | `state_header_prefix` | string | 选填 | "x-context-state" | 状态相关请求头前缀 |
+
+### 对话轮次完整性配置
+
+| 名称 | 数据类型 | 填写要求 | 默认值 | 描述 |
+|----------------|-----------------|------|-----|----------------------------------|
+| `preserve_turn_pairs` | bool | 选填 | false | 保持 user-assistant 消息对完整性，避免拆分配对 |
+
+### 指令/消息固定配置
+
+| 名称 | 数据类型 | 填写要求 | 默认值 | 描述 |
+|----------------|-----------------|------|-----|----------------------------------|
+| `pinned_message_roles` | []string | 选填 | 无 | 固定不被淘汰的消息角色列表（如 ["tool", "function"]） |
+
+### 上下文缓存提示配置（Google ADK ContextCacheConfig 风格）
+
+| 名称 | 数据类型 | 填写要求 | 默认值 | 描述 |
+|----------------|-----------------|------|-----|----------------------------------|
+| `cache_system_prompt` | bool | 选填 | false | 启用系统提示词缓存提示（添加响应头） |
+| `cache_min_tokens` | int | 选填 | 0 | 触发缓存提示的最小 Token 数 |
+
+### 响应 Token 追踪配置
+
+| 名称 | 数据类型 | 填写要求 | 默认值 | 描述 |
+|----------------|-----------------|------|-----|----------------------------------|
+| `track_token_usage` | bool | 选填 | false | 从模型响应中提取 Token 使用信息并添加到响应头 |
 
 ## 配置示例
 
@@ -118,6 +148,25 @@ state_scope: "user"
 state_header_prefix: "x-context-state"
 inject_memory: true
 memory_key: "x-session-memory"
+```
+
+### 启用轮次完整性保护 + 工具消息固定
+
+```yaml
+summarize_strategy: compaction
+compaction_interval: 3
+overlap_size: 2
+preserve_turn_pairs: true
+pinned_message_roles: ["tool", "function"]
+preserve_system_message: true
+```
+
+### 启用上下文缓存提示 + Token 追踪
+
+```yaml
+cache_system_prompt: true
+cache_min_tokens: 100
+track_token_usage: true
 ```
 
 ## 工作原理
@@ -186,6 +235,43 @@ compaction_interval: 3, overlap_size: 2
 
 状态通过请求头传递：`{state_header_prefix}-{scope}`
 
+### 对话轮次完整性
+
+当启用 `preserve_turn_pairs: true` 时，上下文管理在截断/压缩后会检查消息对完整性：
+- user-assistant 消息对作为原子单元处理
+- 孤立的 assistant 消息（无对应 user）被移除
+- 末尾的 user 消息（最新查询）被保留
+- tool/function/system 消息独立保留
+
+```
+截断后: [助手2(孤立), 用户3, 助手3, 用户4]
+轮次完整性修复后: [用户3, 助手3, 用户4]
+```
+
+### 指令/消息固定
+
+当配置 `pinned_message_roles: ["tool", "function"]` 时，固定角色的消息在上下文管理过程中不会被移除：
+
+```
+原始: [系统, 用户1, 助手1, 工具结果, 用户2, 助手2, 用户3]
+max_messages: 3
+
+处理后: [系统, 工具结果(固定), 助手2, 用户3]
+```
+
+### 上下文缓存提示
+
+当启用 `cache_system_prompt: true` 且系统提示词 Token 数 ≥ `cache_min_tokens` 时，在响应头中添加缓存提示：
+- `x-context-cache-status: eligible` - 标记可缓存
+- `x-context-cache-tokens: <token数>` - 系统提示词 Token 数
+
+### 响应 Token 追踪
+
+当启用 `track_token_usage: true` 时，从模型响应中提取 Token 使用信息：
+- `x-context-prompt-tokens` - 输入 Token 数
+- `x-context-completion-tokens` - 输出 Token 数
+- `x-context-total-tokens` - 总 Token 数
+
 ## 请求示例
 
 ### 基础使用
@@ -231,6 +317,8 @@ curl http://localhost/v1/chat/completions \
 4. **性能优化**：减少处理时间和响应延迟
 5. **长对话支持**：通过上下文压缩支持超长对话而不丢失关键信息
 6. **多作用域状态管理**：按 session/user/app/temp 管理不同生命周期的状态
+7. **工具调用场景**：正确处理包含 tool_calls/function_call 的复杂对话
+8. **Token 成本监控**：通过响应 Token 追踪监控 API 调用成本
 
 ## 注意事项
 
@@ -240,3 +328,6 @@ curl http://localhost/v1/chat/completions \
 4. 记忆注入需要配合会话管理服务使用
 5. 上下文压缩使用提取式摘要（非 LLM 生成），适合网关层快速处理
 6. 建议 `overlap_size` 设置为 1-3，以平衡上下文连续性和压缩效率
+7. 启用 `preserve_turn_pairs` 可能会导致实际保留的消息数略少于 `max_messages`
+8. `pinned_message_roles` 中的消息不计入 `max_messages` 限制
+9. 上下文缓存提示需要上游服务配合实现实际缓存逻辑
