@@ -880,3 +880,355 @@ func TestOnHttpRequestBodyCompaction(t *testing.T) {
 		})
 	})
 }
+
+// --- Tests for newly added Google ADK-inspired features ---
+
+// Test configurations for new features
+var turnPairConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"max_messages":            4,
+		"preserve_system_message": true,
+		"preserve_last_n":         2,
+		"summarize_strategy":      "sliding_window",
+		"preserve_turn_pairs":     true,
+	})
+	return data
+}()
+
+var pinnedRolesConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"max_messages":            3,
+		"preserve_system_message": true,
+		"preserve_last_n":         1,
+		"summarize_strategy":      "sliding_window",
+		"pinned_message_roles":    []string{"tool", "function"},
+	})
+	return data
+}()
+
+var cacheConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"cache_system_prompt": true,
+		"cache_min_tokens":    5,
+	})
+	return data
+}()
+
+var trackTokenConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"track_token_usage": true,
+	})
+	return data
+}()
+
+func TestParseConfigNewFeatures(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		t.Run("parse turn pair config", func(t *testing.T) {
+			host, status := test.NewTestHost(turnPairConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			config, err := host.GetMatchConfig()
+			require.NoError(t, err)
+			ctxConfig := config.(*ContextManagerConfig)
+			require.True(t, ctxConfig.PreserveTurnPairs)
+			require.Equal(t, 4, ctxConfig.MaxMessages)
+		})
+
+		t.Run("parse pinned roles config", func(t *testing.T) {
+			host, status := test.NewTestHost(pinnedRolesConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			config, err := host.GetMatchConfig()
+			require.NoError(t, err)
+			ctxConfig := config.(*ContextManagerConfig)
+			require.Equal(t, []string{"tool", "function"}, ctxConfig.PinnedMessageRoles)
+		})
+
+		t.Run("parse cache config", func(t *testing.T) {
+			host, status := test.NewTestHost(cacheConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			config, err := host.GetMatchConfig()
+			require.NoError(t, err)
+			ctxConfig := config.(*ContextManagerConfig)
+			require.True(t, ctxConfig.CacheSystemPrompt)
+			require.Equal(t, 5, ctxConfig.CacheMinTokens)
+		})
+
+		t.Run("parse track token config", func(t *testing.T) {
+			host, status := test.NewTestHost(trackTokenConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			config, err := host.GetMatchConfig()
+			require.NoError(t, err)
+			ctxConfig := config.(*ContextManagerConfig)
+			require.True(t, ctxConfig.TrackTokenUsage)
+		})
+
+		t.Run("defaults for new fields in empty config", func(t *testing.T) {
+			host, status := test.NewTestHost(emptyContextConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			config, err := host.GetMatchConfig()
+			require.NoError(t, err)
+			ctxConfig := config.(*ContextManagerConfig)
+			require.False(t, ctxConfig.PreserveTurnPairs)
+			require.Nil(t, ctxConfig.PinnedMessageRoles)
+			require.False(t, ctxConfig.CacheSystemPrompt)
+			require.Equal(t, 0, ctxConfig.CacheMinTokens)
+			require.False(t, ctxConfig.TrackTokenUsage)
+		})
+	})
+}
+
+func TestExtractPinnedMessages(t *testing.T) {
+	t.Run("extracts tool messages as pinned", func(t *testing.T) {
+		messages := []Message{
+			{Role: "user", Content: "Call the search tool"},
+			{Role: "assistant", Content: "Calling search..."},
+			{Role: "tool", Content: "Search result: found 5 items"},
+			{Role: "user", Content: "Great, next question"},
+			{Role: "assistant", Content: "Sure!"},
+		}
+		pinned, unpinned := extractPinnedMessages(messages, []string{"tool"})
+		require.Len(t, pinned, 1)
+		require.Equal(t, "tool", pinned[0].Role)
+		require.Len(t, unpinned, 4)
+	})
+
+	t.Run("extracts multiple pinned roles", func(t *testing.T) {
+		messages := []Message{
+			{Role: "user", Content: "Use tools"},
+			{Role: "tool", Content: "Tool result"},
+			{Role: "function", Content: "Function result"},
+			{Role: "assistant", Content: "Done"},
+		}
+		pinned, unpinned := extractPinnedMessages(messages, []string{"tool", "function"})
+		require.Len(t, pinned, 2)
+		require.Len(t, unpinned, 2)
+	})
+
+	t.Run("no pinned roles returns all as unpinned", func(t *testing.T) {
+		messages := []Message{
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "Hi!"},
+		}
+		pinned, unpinned := extractPinnedMessages(messages, []string{"tool"})
+		require.Len(t, pinned, 0)
+		require.Len(t, unpinned, 2)
+	})
+
+	t.Run("empty messages", func(t *testing.T) {
+		pinned, unpinned := extractPinnedMessages([]Message{}, []string{"tool"})
+		require.Len(t, pinned, 0)
+		require.Len(t, unpinned, 0)
+	})
+}
+
+func TestEnsureTurnPairIntegrity(t *testing.T) {
+	t.Run("keeps complete user-assistant pairs", func(t *testing.T) {
+		messages := []Message{
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "Hi!"},
+			{Role: "user", Content: "How are you?"},
+			{Role: "assistant", Content: "Fine!"},
+		}
+		result := ensureTurnPairIntegrity(messages)
+		require.Len(t, result, 4)
+	})
+
+	t.Run("removes orphaned assistant at start", func(t *testing.T) {
+		messages := []Message{
+			{Role: "assistant", Content: "Orphaned response"},
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "Hi!"},
+		}
+		result := ensureTurnPairIntegrity(messages)
+		require.Len(t, result, 2)
+		require.Equal(t, "user", result[0].Role)
+		require.Equal(t, "assistant", result[1].Role)
+	})
+
+	t.Run("keeps trailing user message (latest query)", func(t *testing.T) {
+		messages := []Message{
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "Hi!"},
+			{Role: "user", Content: "Latest question"},
+		}
+		result := ensureTurnPairIntegrity(messages)
+		require.Len(t, result, 3)
+		require.Equal(t, "Latest question", result[2].Content)
+	})
+
+	t.Run("preserves tool messages", func(t *testing.T) {
+		messages := []Message{
+			{Role: "user", Content: "Call tool"},
+			{Role: "assistant", Content: "Calling..."},
+			{Role: "tool", Content: "Tool result"},
+			{Role: "user", Content: "Next"},
+		}
+		result := ensureTurnPairIntegrity(messages)
+		require.Len(t, result, 4)
+		require.Equal(t, "tool", result[2].Role)
+	})
+
+	t.Run("preserves system summary messages", func(t *testing.T) {
+		messages := []Message{
+			{Role: "system", Content: "[Summary] Previous context..."},
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "Hi!"},
+		}
+		result := ensureTurnPairIntegrity(messages)
+		require.Len(t, result, 3)
+		require.Equal(t, "system", result[0].Role)
+	})
+
+	t.Run("empty messages returns empty", func(t *testing.T) {
+		result := ensureTurnPairIntegrity([]Message{})
+		require.Len(t, result, 0)
+	})
+}
+
+func TestIsToolMessage(t *testing.T) {
+	t.Run("identifies tool role", func(t *testing.T) {
+		require.True(t, isToolMessage(Message{Role: "tool", Content: "result"}))
+	})
+
+	t.Run("identifies function role", func(t *testing.T) {
+		require.True(t, isToolMessage(Message{Role: "function", Content: "result"}))
+	})
+
+	t.Run("identifies tool_calls field", func(t *testing.T) {
+		require.True(t, isToolMessage(Message{Role: "assistant", ToolCalls: []interface{}{}}))
+	})
+
+	t.Run("identifies tool_call_id field", func(t *testing.T) {
+		require.True(t, isToolMessage(Message{Role: "tool", ToolCallID: "call_123"}))
+	})
+
+	t.Run("identifies function_call field", func(t *testing.T) {
+		require.True(t, isToolMessage(Message{Role: "assistant", FunctionCall: map[string]interface{}{"name": "fn"}}))
+	})
+
+	t.Run("regular user message is not tool", func(t *testing.T) {
+		require.False(t, isToolMessage(Message{Role: "user", Content: "Hello"}))
+	})
+
+	t.Run("regular assistant message is not tool", func(t *testing.T) {
+		require.False(t, isToolMessage(Message{Role: "assistant", Content: "Hi!"}))
+	})
+}
+
+func TestManageContextWithPinnedRoles(t *testing.T) {
+	t.Run("preserves pinned tool messages during sliding window", func(t *testing.T) {
+		config := ContextManagerConfig{
+			MaxMessages:           3,
+			PreserveSystemMessage: true,
+			PreserveLastN:         1,
+			SummarizeStrategy:     "sliding_window",
+			PinnedMessageRoles:    []string{"tool"},
+			TokenEstimateRatio:    4.0,
+		}
+		messages := []Message{
+			{Role: "system", Content: "You are helpful"},
+			{Role: "user", Content: "Old message 1"},
+			{Role: "assistant", Content: "Old response 1"},
+			{Role: "tool", Content: "Important tool result"},
+			{Role: "user", Content: "Message 2"},
+			{Role: "assistant", Content: "Response 2"},
+			{Role: "user", Content: "Latest question"},
+		}
+		result := manageContext(messages, config)
+
+		// Should contain: system + pinned tool message + some recent messages
+		hasSystem := false
+		hasTool := false
+		for _, msg := range result {
+			if msg.Role == "system" && msg.Content == "You are helpful" {
+				hasSystem = true
+			}
+			if msg.Role == "tool" {
+				hasTool = true
+			}
+		}
+		require.True(t, hasSystem, "system message should be preserved")
+		require.True(t, hasTool, "pinned tool message should be preserved")
+	})
+}
+
+func TestManageContextWithTurnPairs(t *testing.T) {
+	t.Run("sliding window with turn pair integrity", func(t *testing.T) {
+		config := ContextManagerConfig{
+			MaxMessages:           3,
+			PreserveSystemMessage: true,
+			PreserveLastN:         1,
+			SummarizeStrategy:     "sliding_window",
+			PreserveTurnPairs:     true,
+			TokenEstimateRatio:    4.0,
+		}
+		messages := []Message{
+			{Role: "system", Content: "You are helpful"},
+			{Role: "user", Content: "Message 1"},
+			{Role: "assistant", Content: "Response 1"},
+			{Role: "user", Content: "Message 2"},
+			{Role: "assistant", Content: "Response 2"},
+			{Role: "user", Content: "Latest question"},
+		}
+		result := manageContext(messages, config)
+
+		// After turn-pair integrity, no orphaned assistants should remain
+		for i, msg := range result {
+			if msg.Role == "assistant" {
+				// Must be preceded by a user message (or system/tool)
+				require.True(t, i > 0, "assistant should not be first")
+				prevRole := result[i-1].Role
+				require.True(t, prevRole == "user" || prevRole == "system" || prevRole == "tool",
+					"assistant should follow user/system/tool, got: %s", prevRole)
+			}
+		}
+	})
+}
+
+func TestToolMessageHandling(t *testing.T) {
+	t.Run("preserves tool_calls and tool_call_id in messages", func(t *testing.T) {
+		msg := Message{
+			Role:       "assistant",
+			Content:    "",
+			ToolCalls:  []interface{}{map[string]interface{}{"id": "call_1", "type": "function"}},
+			ToolCallID: "",
+		}
+		require.True(t, isToolMessage(msg))
+
+		toolResult := Message{
+			Role:       "tool",
+			Content:    "result data",
+			ToolCallID: "call_1",
+		}
+		require.True(t, isToolMessage(toolResult))
+	})
+
+	t.Run("tool messages survive context management", func(t *testing.T) {
+		config := ContextManagerConfig{
+			MaxMessages:           0,
+			MaxTokens:             0,
+			PreserveSystemMessage: true,
+			TokenEstimateRatio:    4.0,
+		}
+		messages := []Message{
+			{Role: "system", Content: "You are helpful"},
+			{Role: "user", Content: "Call search"},
+			{Role: "assistant", Content: ""},
+			{Role: "tool", Content: "Search results here", ToolCallID: "call_1"},
+			{Role: "assistant", Content: "Based on the search..."},
+			{Role: "user", Content: "Thanks"},
+		}
+		result := manageContext(messages, config)
+		// No limits set, all messages should be preserved
+		require.Len(t, result, 6)
+	})
+}

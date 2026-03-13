@@ -39,13 +39,19 @@ func init() {
 		wrapper.ParseConfig(parseConfig),
 		wrapper.ProcessRequestHeaders(onHttpRequestHeaders),
 		wrapper.ProcessRequestBody(onHttpRequestBody),
+		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
+		wrapper.ProcessResponseBody(onHttpResponseBody),
 	)
 }
 
-// Message represents a chat message
+// Message represents a chat message with support for tool calls and function calls
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role         string      `json:"role"`
+	Content      string      `json:"content"`
+	ToolCalls    interface{} `json:"tool_calls,omitempty"`
+	ToolCallID   string      `json:"tool_call_id,omitempty"`
+	FunctionCall interface{} `json:"function_call,omitempty"`
+	Name         string      `json:"name,omitempty"`
 }
 
 // ContextManagerConfig contains configuration for context management
@@ -89,6 +95,35 @@ type ContextManagerConfig struct {
 	StateScope string `json:"state_scope"`
 	// StateHeaderPrefix is the prefix for state-related headers
 	StateHeaderPrefix string `json:"state_header_prefix"`
+
+	// --- Turn-pair Integrity (Google ADK inspired) ---
+
+	// PreserveTurnPairs ensures user-assistant message pairs are kept as atomic units
+	// during compaction/truncation. If true, when removing messages, the paired
+	// assistant response is also removed with its user message (and vice versa).
+	PreserveTurnPairs bool `json:"preserve_turn_pairs"`
+
+	// --- Instruction Pinning (Google ADK inspired) ---
+
+	// PinnedMessageRoles specifies additional message roles to always preserve
+	// beyond the system message. Messages with these roles are never evicted.
+	// e.g., ["tool", "function"] to keep tool/function call results
+	PinnedMessageRoles []string `json:"pinned_message_roles"`
+
+	// --- Context Caching Hints (Google ADK ContextCacheConfig inspired) ---
+
+	// CacheSystemPrompt enables caching hints for system prompt. When enabled,
+	// adds x-context-cache-status response header to indicate cacheable content.
+	CacheSystemPrompt bool `json:"cache_system_prompt"`
+	// CacheMinTokens is the minimum token count for a system prompt to be
+	// considered for caching (similar to ADK's min_tokens). Default: 0 (always cache).
+	CacheMinTokens int `json:"cache_min_tokens"`
+
+	// --- Response Context Tracking (Google ADK lifecycle processing inspired) ---
+
+	// TrackTokenUsage enables response processing to extract and forward
+	// token usage metadata from model responses.
+	TrackTokenUsage bool `json:"track_token_usage"`
 }
 
 func parseConfig(json gjson.Result, config *ContextManagerConfig) error {
@@ -107,6 +142,11 @@ func parseConfig(json gjson.Result, config *ContextManagerConfig) error {
 	config.CompactionSummaryTemplate = "[Context Summary] The following is a summary of the previous conversation:\n{summary}"
 	config.StateScope = "session"
 	config.StateHeaderPrefix = "x-context-state"
+	config.PreserveTurnPairs = false
+	config.PinnedMessageRoles = nil
+	config.CacheSystemPrompt = false
+	config.CacheMinTokens = 0
+	config.TrackTokenUsage = false
 
 	// Parse max_messages
 	if json.Get("max_messages").Exists() {
@@ -178,6 +218,33 @@ func parseConfig(json gjson.Result, config *ContextManagerConfig) error {
 		config.StateHeaderPrefix = json.Get("state_header_prefix").String()
 	}
 
+	// Parse preserve_turn_pairs
+	if json.Get("preserve_turn_pairs").Exists() {
+		config.PreserveTurnPairs = json.Get("preserve_turn_pairs").Bool()
+	}
+
+	// Parse pinned_message_roles
+	if json.Get("pinned_message_roles").Exists() {
+		for _, role := range json.Get("pinned_message_roles").Array() {
+			config.PinnedMessageRoles = append(config.PinnedMessageRoles, role.String())
+		}
+	}
+
+	// Parse cache_system_prompt
+	if json.Get("cache_system_prompt").Exists() {
+		config.CacheSystemPrompt = json.Get("cache_system_prompt").Bool()
+	}
+
+	// Parse cache_min_tokens
+	if json.Get("cache_min_tokens").Exists() {
+		config.CacheMinTokens = int(json.Get("cache_min_tokens").Int())
+	}
+
+	// Parse track_token_usage
+	if json.Get("track_token_usage").Exists() {
+		config.TrackTokenUsage = json.Get("track_token_usage").Bool()
+	}
+
 	return nil
 }
 
@@ -213,13 +280,39 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config ContextManagerConfig, bod
 		return types.ActionContinue
 	}
 
-	// Parse messages into structs
+	// Parse messages into structs with tool/function call support
 	var msgList []Message
 	for _, msg := range messages.Array() {
-		msgList = append(msgList, Message{
+		m := Message{
 			Role:    msg.Get("role").String(),
 			Content: msg.Get("content").String(),
-		})
+		}
+		// Preserve tool_calls field
+		if msg.Get("tool_calls").Exists() {
+			m.ToolCalls = msg.Get("tool_calls").Value()
+		}
+		// Preserve tool_call_id field
+		if msg.Get("tool_call_id").Exists() {
+			m.ToolCallID = msg.Get("tool_call_id").String()
+		}
+		// Preserve function_call field
+		if msg.Get("function_call").Exists() {
+			m.FunctionCall = msg.Get("function_call").Value()
+		}
+		// Preserve name field
+		if msg.Get("name").Exists() {
+			m.Name = msg.Get("name").String()
+		}
+		msgList = append(msgList, m)
+	}
+
+	// Context caching hints: check if system prompt is cache-eligible
+	if config.CacheSystemPrompt && len(msgList) > 0 && msgList[0].Role == "system" {
+		sysTokens := estimateTokens(msgList[0].Content, config.TokenEstimateRatio)
+		if sysTokens >= config.CacheMinTokens {
+			ctx.SetContext("cache_system_prompt", "true")
+			ctx.SetContext("system_prompt_tokens", itoa(sysTokens))
+		}
 	}
 
 	// Inject memory if available
@@ -272,23 +365,38 @@ func manageContext(messages []Message, config ContextManagerConfig) []Message {
 	// Get non-system messages
 	nonSystemMessages := messages[startIdx:]
 
-	// Apply limits based on strategy
+	// Extract pinned messages (messages with pinned roles that must be preserved)
+	var pinnedMessages []Message
+	var unpinnedMessages []Message
+	if len(config.PinnedMessageRoles) > 0 {
+		pinnedMessages, unpinnedMessages = extractPinnedMessages(nonSystemMessages, config.PinnedMessageRoles)
+	} else {
+		unpinnedMessages = nonSystemMessages
+	}
+
+	// Apply limits based on strategy to unpinned messages only
 	switch config.SummarizeStrategy {
 	case "truncate":
-		nonSystemMessages = applyTruncateStrategy(nonSystemMessages, config)
+		unpinnedMessages = applyTruncateStrategy(unpinnedMessages, config)
 	case "compaction":
-		nonSystemMessages = applyCompactionStrategy(nonSystemMessages, config)
+		unpinnedMessages = applyCompactionStrategy(unpinnedMessages, config)
 	case "sliding_window":
 		fallthrough
 	default:
-		nonSystemMessages = applySlidingWindowStrategy(nonSystemMessages, config)
+		unpinnedMessages = applySlidingWindowStrategy(unpinnedMessages, config)
 	}
 
-	// Rebuild result
+	// Apply turn-pair integrity if enabled
+	if config.PreserveTurnPairs {
+		unpinnedMessages = ensureTurnPairIntegrity(unpinnedMessages)
+	}
+
+	// Rebuild result: system + pinned + processed unpinned
 	if systemMessage != nil {
 		result = append(result, *systemMessage)
 	}
-	result = append(result, nonSystemMessages...)
+	result = append(result, pinnedMessages...)
+	result = append(result, unpinnedMessages...)
 
 	return result
 }
@@ -501,6 +609,128 @@ func buildScopeKey(scope, key string) string {
 		scope = "session"
 	}
 	return scope + ":" + key
+}
+
+// extractPinnedMessages separates messages with pinned roles from the rest
+func extractPinnedMessages(messages []Message, pinnedRoles []string) (pinned []Message, unpinned []Message) {
+	roleSet := make(map[string]bool, len(pinnedRoles))
+	for _, role := range pinnedRoles {
+		roleSet[role] = true
+	}
+
+	for _, msg := range messages {
+		if roleSet[msg.Role] {
+			pinned = append(pinned, msg)
+		} else {
+			unpinned = append(unpinned, msg)
+		}
+	}
+	return
+}
+
+// ensureTurnPairIntegrity ensures user-assistant message pairs are kept as atomic units.
+// If a user message exists without its following assistant response (or vice versa),
+// the orphaned message is removed to maintain pair integrity.
+func ensureTurnPairIntegrity(messages []Message) []Message {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	result := make([]Message, 0, len(messages))
+	i := 0
+	for i < len(messages) {
+		msg := messages[i]
+
+		// Handle tool/function messages: keep them as-is (they don't form user-assistant pairs)
+		if isToolMessage(msg) {
+			result = append(result, msg)
+			i++
+			continue
+		}
+
+		// Handle compaction summary messages (system role from compaction)
+		if msg.Role == "system" {
+			result = append(result, msg)
+			i++
+			continue
+		}
+
+		// Look for user-assistant pair
+		if msg.Role == "user" {
+			if i+1 < len(messages) && messages[i+1].Role == "assistant" {
+				// Complete pair: keep both
+				result = append(result, msg, messages[i+1])
+				i += 2
+			} else {
+				// Orphan user at the end of the list - keep it (it's the latest query)
+				result = append(result, msg)
+				i++
+			}
+		} else if msg.Role == "assistant" {
+			// Orphaned assistant without preceding user - skip it
+			i++
+		} else {
+			// Unknown role, keep it
+			result = append(result, msg)
+			i++
+		}
+	}
+
+	return result
+}
+
+// isToolMessage checks if a message is a tool call or tool result
+func isToolMessage(msg Message) bool {
+	return msg.Role == "tool" || msg.Role == "function" ||
+		msg.ToolCalls != nil || msg.ToolCallID != "" ||
+		msg.FunctionCall != nil
+}
+
+// onHttpResponseHeaders processes response headers for context tracking
+func onHttpResponseHeaders(ctx wrapper.HttpContext, config ContextManagerConfig) types.Action {
+	// Add context cache status header if caching is enabled
+	if config.CacheSystemPrompt {
+		if cacheStatus, ok := ctx.GetContext("cache_system_prompt").(string); ok && cacheStatus == "true" {
+			if tokens, ok := ctx.GetContext("system_prompt_tokens").(string); ok {
+				proxywasm.AddHttpResponseHeader("x-context-cache-status", "eligible")
+				proxywasm.AddHttpResponseHeader("x-context-cache-tokens", tokens)
+			}
+		}
+	}
+
+	// Buffer response body if we need to track token usage
+	if config.TrackTokenUsage {
+		ctx.BufferResponseBody()
+	}
+
+	return types.ActionContinue
+}
+
+// onHttpResponseBody processes response body for context metadata extraction
+func onHttpResponseBody(ctx wrapper.HttpContext, config ContextManagerConfig, body []byte) types.Action {
+	if !config.TrackTokenUsage {
+		return types.ActionContinue
+	}
+
+	// Extract token usage from response (OpenAI-compatible format)
+	usage := gjson.GetBytes(body, "usage")
+	if usage.Exists() {
+		promptTokens := usage.Get("prompt_tokens").String()
+		completionTokens := usage.Get("completion_tokens").String()
+		totalTokens := usage.Get("total_tokens").String()
+
+		if promptTokens != "" {
+			proxywasm.AddHttpResponseHeader("x-context-prompt-tokens", promptTokens)
+		}
+		if completionTokens != "" {
+			proxywasm.AddHttpResponseHeader("x-context-completion-tokens", completionTokens)
+		}
+		if totalTokens != "" {
+			proxywasm.AddHttpResponseHeader("x-context-total-tokens", totalTokens)
+		}
+	}
+
+	return types.ActionContinue
 }
 
 // injectMemory adds session memory to the context
