@@ -43,7 +43,7 @@ Plugin execution priority: `500`
 
 | Name | Data Type | Requirement | Default Value | Description |
 |----------------|-----------------|------|-----|----------------------------------|
-| `compaction_interval` | int | optional | 0 (disabled) | Conversation turn interval to trigger compaction (similar to ADK's compaction_interval) |
+| `compaction_interval` | int | optional | 0 (disabled) | Conversation turn interval to trigger compaction, counted by user messages (similar to ADK's compaction_interval) |
 | `overlap_size` | int | optional | 1 | Number of overlap messages to keep between compaction windows (similar to ADK's overlap_size) |
 | `token_threshold` | int | optional | 0 (disabled) | Token count threshold to trigger compaction |
 | `compaction_summary_template` | string | optional | see below | Summary message template, use `{summary}` placeholder |

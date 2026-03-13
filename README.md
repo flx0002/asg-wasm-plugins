@@ -43,7 +43,7 @@ AI 上下文管理插件，用于管理 LLM 对话的上下文窗口，参考 Go
 
 | 名称 | 数据类型 | 填写要求 | 默认值 | 描述 |
 |----------------|-----------------|------|-----|----------------------------------|
-| `compaction_interval` | int | 选填 | 0 (禁用) | 对话轮次间隔触发压缩（类似 ADK 的 compaction_interval） |
+| `compaction_interval` | int | 选填 | 0 (禁用) | 对话轮次间隔触发压缩（按用户消息数计数，类似 ADK 的 compaction_interval） |
 | `overlap_size` | int | 选填 | 1 | 压缩窗口间保留的重叠消息数（类似 ADK 的 overlap_size） |
 | `token_threshold` | int | 选填 | 0 (禁用) | Token 数量阈值触发压缩 |
 | `compaction_summary_template` | string | 选填 | 见下方 | 摘要消息模板，使用 `{summary}` 占位符 |

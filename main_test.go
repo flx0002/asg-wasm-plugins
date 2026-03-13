@@ -16,6 +16,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
@@ -626,10 +627,7 @@ func TestCompactMessages(t *testing.T) {
 	})
 
 	t.Run("truncates long messages in summary", func(t *testing.T) {
-		longContent := ""
-		for i := 0; i < 300; i++ {
-			longContent += "a"
-		}
+		longContent := strings.Repeat("a", 300)
 		messages := []Message{
 			{Role: "user", Content: longContent},
 		}
