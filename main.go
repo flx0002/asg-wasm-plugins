@@ -16,6 +16,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
@@ -57,7 +58,7 @@ type ContextManagerConfig struct {
 	PreserveSystemMessage bool `json:"preserve_system_message"`
 	// PreserveLastN keeps the last N messages regardless of limits
 	PreserveLastN int `json:"preserve_last_n"`
-	// SummarizeStrategy defines how to summarize context ("truncate" or "sliding_window")
+	// SummarizeStrategy defines how to manage context: "truncate", "sliding_window", or "compaction"
 	SummarizeStrategy string `json:"summarize_strategy"`
 	// TokenEstimateRatio is the approximate characters per token ratio
 	TokenEstimateRatio float64 `json:"token_estimate_ratio"`
@@ -65,6 +66,29 @@ type ContextManagerConfig struct {
 	MemoryKey string `json:"memory_key"`
 	// InjectMemory indicates whether to inject memory into context
 	InjectMemory bool `json:"inject_memory"`
+
+	// --- Context Compression / Compaction (Google ADK inspired) ---
+
+	// CompactionInterval is the number of conversation turns (user-assistant pairs)
+	// after which context compaction is triggered (0 = use max_messages/max_tokens as trigger)
+	CompactionInterval int `json:"compaction_interval"`
+	// OverlapSize is the number of recent messages to keep uncompressed alongside the
+	// compacted summary for context continuity (similar to ADK's overlap_size)
+	OverlapSize int `json:"overlap_size"`
+	// TokenThreshold triggers compaction when the estimated total token count exceeds
+	// this value (0 = disabled). This is an alternative trigger to compaction_interval.
+	TokenThreshold int `json:"token_threshold"`
+	// CompactionSummaryTemplate is the template for creating summary messages.
+	// Use {summary} as a placeholder for the extracted summary content.
+	CompactionSummaryTemplate string `json:"compaction_summary_template"`
+
+	// --- Scoped State Management (Google ADK inspired) ---
+
+	// StateScope defines the scope prefix for state management.
+	// Supported values: "session" (default), "user", "app", "temp"
+	StateScope string `json:"state_scope"`
+	// StateHeaderPrefix is the prefix for state-related headers
+	StateHeaderPrefix string `json:"state_header_prefix"`
 }
 
 func parseConfig(json gjson.Result, config *ContextManagerConfig) error {
@@ -77,6 +101,12 @@ func parseConfig(json gjson.Result, config *ContextManagerConfig) error {
 	config.TokenEstimateRatio = 4.0 // ~4 chars per token for English
 	config.MemoryKey = "x-session-memory"
 	config.InjectMemory = false
+	config.CompactionInterval = 0
+	config.OverlapSize = 1
+	config.TokenThreshold = 0
+	config.CompactionSummaryTemplate = "[Context Summary] The following is a summary of the previous conversation:\n{summary}"
+	config.StateScope = "session"
+	config.StateHeaderPrefix = "x-context-state"
 
 	// Parse max_messages
 	if json.Get("max_messages").Exists() {
@@ -118,6 +148,36 @@ func parseConfig(json gjson.Result, config *ContextManagerConfig) error {
 		config.InjectMemory = json.Get("inject_memory").Bool()
 	}
 
+	// Parse compaction_interval
+	if json.Get("compaction_interval").Exists() {
+		config.CompactionInterval = int(json.Get("compaction_interval").Int())
+	}
+
+	// Parse overlap_size
+	if json.Get("overlap_size").Exists() {
+		config.OverlapSize = int(json.Get("overlap_size").Int())
+	}
+
+	// Parse token_threshold
+	if json.Get("token_threshold").Exists() {
+		config.TokenThreshold = int(json.Get("token_threshold").Int())
+	}
+
+	// Parse compaction_summary_template
+	if json.Get("compaction_summary_template").Exists() {
+		config.CompactionSummaryTemplate = json.Get("compaction_summary_template").String()
+	}
+
+	// Parse state_scope
+	if json.Get("state_scope").Exists() {
+		config.StateScope = json.Get("state_scope").String()
+	}
+
+	// Parse state_header_prefix
+	if json.Get("state_header_prefix").Exists() {
+		config.StateHeaderPrefix = json.Get("state_header_prefix").String()
+	}
+
 	return nil
 }
 
@@ -130,6 +190,16 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config ContextManagerConfig) 
 		memory, _ := proxywasm.GetHttpRequestHeader(config.MemoryKey)
 		if memory != "" {
 			ctx.SetContext("session_memory", memory)
+		}
+	}
+
+	// Handle scoped state management: read state from headers with scope prefix
+	if config.StateHeaderPrefix != "" {
+		scopeKey := buildScopeKey(config.StateScope, "data")
+		stateHeader := config.StateHeaderPrefix + "-" + config.StateScope
+		stateData, _ := proxywasm.GetHttpRequestHeader(stateHeader)
+		if stateData != "" {
+			ctx.SetContext(scopeKey, stateData)
 		}
 	}
 
@@ -184,8 +254,8 @@ func manageContext(messages []Message, config ContextManagerConfig) []Message {
 		return messages
 	}
 
-	// If no limits set, return original messages
-	if config.MaxMessages == 0 && config.MaxTokens == 0 {
+	// If no limits set and not using compaction, return original messages
+	if config.MaxMessages == 0 && config.MaxTokens == 0 && config.SummarizeStrategy != "compaction" {
 		return messages
 	}
 
@@ -206,6 +276,8 @@ func manageContext(messages []Message, config ContextManagerConfig) []Message {
 	switch config.SummarizeStrategy {
 	case "truncate":
 		nonSystemMessages = applyTruncateStrategy(nonSystemMessages, config)
+	case "compaction":
+		nonSystemMessages = applyCompactionStrategy(nonSystemMessages, config)
 	case "sliding_window":
 		fallthrough
 	default:
@@ -290,6 +362,145 @@ func estimateTokens(text string, ratio float64) int {
 		ratio = 4.0
 	}
 	return int(float64(len(text)) / ratio)
+}
+
+// estimateTotalTokens estimates the total token count for a list of messages
+func estimateTotalTokens(messages []Message, ratio float64) int {
+	total := 0
+	for _, msg := range messages {
+		total += estimateTokens(msg.Content, ratio)
+	}
+	return total
+}
+
+// shouldCompact determines whether compaction should be triggered based on configuration
+func shouldCompact(messages []Message, config ContextManagerConfig) bool {
+	// Check compaction_interval: count conversation turns (user-assistant pairs)
+	if config.CompactionInterval > 0 {
+		turns := countConversationTurns(messages)
+		if turns >= config.CompactionInterval {
+			return true
+		}
+	}
+
+	// Check token_threshold
+	if config.TokenThreshold > 0 {
+		totalTokens := estimateTotalTokens(messages, config.TokenEstimateRatio)
+		if totalTokens >= config.TokenThreshold {
+			return true
+		}
+	}
+
+	// Check max_messages
+	if config.MaxMessages > 0 && len(messages) > config.MaxMessages {
+		return true
+	}
+
+	// Check max_tokens
+	if config.MaxTokens > 0 {
+		totalTokens := estimateTotalTokens(messages, config.TokenEstimateRatio)
+		if totalTokens > config.MaxTokens {
+			return true
+		}
+	}
+
+	return false
+}
+
+// countConversationTurns counts the number of user-assistant pairs in the messages
+func countConversationTurns(messages []Message) int {
+	turns := 0
+	for _, msg := range messages {
+		if msg.Role == "user" {
+			turns++
+		}
+	}
+	return turns
+}
+
+// applyCompactionStrategy compresses older messages into a summary message,
+// keeping recent messages intact for context continuity (similar to Google ADK's
+// EventsCompactionConfig with compaction_interval and overlap_size)
+func applyCompactionStrategy(messages []Message, config ContextManagerConfig) []Message {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	// Determine if compaction should be triggered
+	if !shouldCompact(messages, config) {
+		return messages
+	}
+
+	// Determine how many recent messages to keep (overlap)
+	overlapSize := config.OverlapSize
+	if overlapSize <= 0 {
+		overlapSize = 1
+	}
+
+	// Also consider preserve_last_n
+	keepRecent := overlapSize
+	if config.PreserveLastN > keepRecent {
+		keepRecent = config.PreserveLastN
+	}
+
+	// Don't compact if there aren't enough messages
+	if len(messages) <= keepRecent {
+		return messages
+	}
+
+	// Split messages: messages to compact vs. messages to keep
+	compactBoundary := len(messages) - keepRecent
+	messagesToCompact := messages[:compactBoundary]
+	messagesToKeep := messages[compactBoundary:]
+
+	// Create summary from older messages
+	summary := compactMessages(messagesToCompact, config.CompactionSummaryTemplate)
+
+	// Build result: summary message + recent messages
+	result := make([]Message, 0, 1+len(messagesToKeep))
+	result = append(result, summary)
+	result = append(result, messagesToKeep...)
+
+	return result
+}
+
+// compactMessages creates a summary message from a list of messages
+func compactMessages(messages []Message, template string) Message {
+	if len(messages) == 0 {
+		return Message{Role: "system", Content: "No previous context."}
+	}
+
+	// Build extractive summary: extract key content from each message
+	var summaryParts []string
+	for _, msg := range messages {
+		content := msg.Content
+		// Truncate very long individual messages for the summary
+		if len(content) > 200 {
+			content = content[:200] + "..."
+		}
+		summaryParts = append(summaryParts, fmt.Sprintf("%s: %s", msg.Role, content))
+	}
+
+	summaryContent := strings.Join(summaryParts, "\n")
+
+	// Apply template
+	if template == "" {
+		template = "[Context Summary] The following is a summary of the previous conversation:\n{summary}"
+	}
+	finalContent := strings.Replace(template, "{summary}", summaryContent, 1)
+
+	return Message{
+		Role:    "system",
+		Content: finalContent,
+	}
+}
+
+// buildScopeKey creates a scoped key for state management (similar to ADK's state prefix system)
+func buildScopeKey(scope, key string) string {
+	if scope == "" {
+		scope = "session"
+	}
+	return scope + ":" + key
 }
 
 // injectMemory adds session memory to the context

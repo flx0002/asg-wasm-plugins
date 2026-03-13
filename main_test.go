@@ -396,3 +396,489 @@ func TestRebuildRequestBody(t *testing.T) {
 		require.Contains(t, string(result), "gpt-3.5")
 	})
 }
+
+// --- Tests for new Google ADK-inspired features ---
+
+// Test configuration for compaction strategy
+var compactionConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"summarize_strategy":         "compaction",
+		"compaction_interval":        3,
+		"overlap_size":               2,
+		"preserve_system_message":    true,
+		"preserve_last_n":            2,
+		"compaction_summary_template": "[Summary] Previous context:\n{summary}",
+	})
+	return data
+}()
+
+// Test configuration for token threshold compaction
+var tokenThresholdConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"summarize_strategy": "compaction",
+		"token_threshold":    50,
+		"overlap_size":       1,
+		"preserve_last_n":    1,
+		"token_estimate_ratio": 4.0,
+	})
+	return data
+}()
+
+// Test configuration for scoped state
+var scopedStateConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"state_scope":          "user",
+		"state_header_prefix":  "x-context-state",
+		"inject_memory":        true,
+		"memory_key":           "x-session-memory",
+	})
+	return data
+}()
+
+func TestParseConfigCompaction(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		t.Run("parse compaction config", func(t *testing.T) {
+			host, status := test.NewTestHost(compactionConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			config, err := host.GetMatchConfig()
+			require.NoError(t, err)
+			require.NotNil(t, config)
+
+			ctxConfig := config.(*ContextManagerConfig)
+			require.Equal(t, "compaction", ctxConfig.SummarizeStrategy)
+			require.Equal(t, 3, ctxConfig.CompactionInterval)
+			require.Equal(t, 2, ctxConfig.OverlapSize)
+			require.Contains(t, ctxConfig.CompactionSummaryTemplate, "{summary}")
+		})
+
+		t.Run("parse token threshold config", func(t *testing.T) {
+			host, status := test.NewTestHost(tokenThresholdConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			config, err := host.GetMatchConfig()
+			require.NoError(t, err)
+			require.NotNil(t, config)
+
+			ctxConfig := config.(*ContextManagerConfig)
+			require.Equal(t, "compaction", ctxConfig.SummarizeStrategy)
+			require.Equal(t, 50, ctxConfig.TokenThreshold)
+			require.Equal(t, 1, ctxConfig.OverlapSize)
+		})
+
+		t.Run("parse scoped state config", func(t *testing.T) {
+			host, status := test.NewTestHost(scopedStateConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			config, err := host.GetMatchConfig()
+			require.NoError(t, err)
+			require.NotNil(t, config)
+
+			ctxConfig := config.(*ContextManagerConfig)
+			require.Equal(t, "user", ctxConfig.StateScope)
+			require.Equal(t, "x-context-state", ctxConfig.StateHeaderPrefix)
+		})
+
+		t.Run("defaults for new fields", func(t *testing.T) {
+			host, status := test.NewTestHost(emptyContextConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			config, err := host.GetMatchConfig()
+			require.NoError(t, err)
+			require.NotNil(t, config)
+
+			ctxConfig := config.(*ContextManagerConfig)
+			require.Equal(t, 0, ctxConfig.CompactionInterval)
+			require.Equal(t, 1, ctxConfig.OverlapSize)
+			require.Equal(t, 0, ctxConfig.TokenThreshold)
+			require.Equal(t, "session", ctxConfig.StateScope)
+			require.Equal(t, "x-context-state", ctxConfig.StateHeaderPrefix)
+			require.Contains(t, ctxConfig.CompactionSummaryTemplate, "{summary}")
+		})
+	})
+}
+
+func TestCountConversationTurns(t *testing.T) {
+	t.Run("counts user messages as turns", func(t *testing.T) {
+		messages := []Message{
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "Hi!"},
+			{Role: "user", Content: "How are you?"},
+			{Role: "assistant", Content: "Fine!"},
+			{Role: "user", Content: "Bye"},
+		}
+		require.Equal(t, 3, countConversationTurns(messages))
+	})
+
+	t.Run("empty messages returns zero", func(t *testing.T) {
+		require.Equal(t, 0, countConversationTurns([]Message{}))
+	})
+
+	t.Run("no user messages returns zero", func(t *testing.T) {
+		messages := []Message{
+			{Role: "assistant", Content: "Hi!"},
+			{Role: "system", Content: "You are helpful"},
+		}
+		require.Equal(t, 0, countConversationTurns(messages))
+	})
+}
+
+func TestEstimateTotalTokens(t *testing.T) {
+	t.Run("calculates total tokens for multiple messages", func(t *testing.T) {
+		messages := []Message{
+			{Role: "user", Content: "Hello World!"}, // 12 chars / 4 = 3 tokens
+			{Role: "assistant", Content: "Hi there!"}, // 9 chars / 4 = 2 tokens
+		}
+		total := estimateTotalTokens(messages, 4.0)
+		require.Equal(t, 5, total)
+	})
+
+	t.Run("empty messages returns zero", func(t *testing.T) {
+		total := estimateTotalTokens([]Message{}, 4.0)
+		require.Equal(t, 0, total)
+	})
+}
+
+func TestShouldCompact(t *testing.T) {
+	t.Run("triggers on compaction interval", func(t *testing.T) {
+		config := ContextManagerConfig{
+			CompactionInterval: 3,
+			TokenEstimateRatio: 4.0,
+		}
+		messages := []Message{
+			{Role: "user", Content: "Msg 1"},
+			{Role: "assistant", Content: "Resp 1"},
+			{Role: "user", Content: "Msg 2"},
+			{Role: "assistant", Content: "Resp 2"},
+			{Role: "user", Content: "Msg 3"},
+		}
+		require.True(t, shouldCompact(messages, config))
+	})
+
+	t.Run("does not trigger below interval", func(t *testing.T) {
+		config := ContextManagerConfig{
+			CompactionInterval: 5,
+			TokenEstimateRatio: 4.0,
+		}
+		messages := []Message{
+			{Role: "user", Content: "Msg 1"},
+			{Role: "assistant", Content: "Resp 1"},
+			{Role: "user", Content: "Msg 2"},
+		}
+		require.False(t, shouldCompact(messages, config))
+	})
+
+	t.Run("triggers on token threshold", func(t *testing.T) {
+		config := ContextManagerConfig{
+			TokenThreshold:     10,
+			TokenEstimateRatio: 4.0,
+		}
+		messages := []Message{
+			{Role: "user", Content: "This is a long message with many tokens that should exceed the threshold"},
+		}
+		require.True(t, shouldCompact(messages, config))
+	})
+
+	t.Run("triggers on max_messages", func(t *testing.T) {
+		config := ContextManagerConfig{
+			MaxMessages:        2,
+			TokenEstimateRatio: 4.0,
+		}
+		messages := []Message{
+			{Role: "user", Content: "Msg 1"},
+			{Role: "assistant", Content: "Resp 1"},
+			{Role: "user", Content: "Msg 2"},
+		}
+		require.True(t, shouldCompact(messages, config))
+	})
+
+	t.Run("does not trigger when no thresholds set", func(t *testing.T) {
+		config := ContextManagerConfig{
+			TokenEstimateRatio: 4.0,
+		}
+		messages := []Message{
+			{Role: "user", Content: "Hello"},
+		}
+		require.False(t, shouldCompact(messages, config))
+	})
+}
+
+func TestCompactMessages(t *testing.T) {
+	t.Run("creates summary from messages", func(t *testing.T) {
+		messages := []Message{
+			{Role: "user", Content: "What is the weather?"},
+			{Role: "assistant", Content: "It's sunny today."},
+			{Role: "user", Content: "What about tomorrow?"},
+			{Role: "assistant", Content: "It might rain."},
+		}
+		template := "[Summary] Previous context:\n{summary}"
+		result := compactMessages(messages, template)
+		require.Equal(t, "system", result.Role)
+		require.Contains(t, result.Content, "[Summary]")
+		require.Contains(t, result.Content, "What is the weather?")
+		require.Contains(t, result.Content, "It's sunny today.")
+		require.Contains(t, result.Content, "What about tomorrow?")
+		require.Contains(t, result.Content, "It might rain.")
+	})
+
+	t.Run("truncates long messages in summary", func(t *testing.T) {
+		longContent := ""
+		for i := 0; i < 300; i++ {
+			longContent += "a"
+		}
+		messages := []Message{
+			{Role: "user", Content: longContent},
+		}
+		result := compactMessages(messages, "{summary}")
+		// Content should be truncated at 200 chars + "..."
+		require.Contains(t, result.Content, "...")
+		require.Less(t, len(result.Content), 300)
+	})
+
+	t.Run("empty messages returns placeholder", func(t *testing.T) {
+		result := compactMessages([]Message{}, "{summary}")
+		require.Equal(t, "system", result.Role)
+		require.Equal(t, "No previous context.", result.Content)
+	})
+
+	t.Run("uses default template when empty", func(t *testing.T) {
+		messages := []Message{
+			{Role: "user", Content: "Hello"},
+		}
+		result := compactMessages(messages, "")
+		require.Contains(t, result.Content, "[Context Summary]")
+	})
+}
+
+func TestApplyCompactionStrategy(t *testing.T) {
+	t.Run("compacts older messages and keeps recent", func(t *testing.T) {
+		config := ContextManagerConfig{
+			CompactionInterval:        3,
+			OverlapSize:               2,
+			PreserveLastN:             2,
+			TokenEstimateRatio:        4.0,
+			CompactionSummaryTemplate: "[Summary]\n{summary}",
+		}
+		messages := []Message{
+			{Role: "user", Content: "Message 1"},
+			{Role: "assistant", Content: "Response 1"},
+			{Role: "user", Content: "Message 2"},
+			{Role: "assistant", Content: "Response 2"},
+			{Role: "user", Content: "Message 3"},
+			{Role: "assistant", Content: "Response 3"},
+		}
+		result := applyCompactionStrategy(messages, config)
+
+		// Should have: 1 summary + 2 recent messages (overlap_size=2)
+		require.Len(t, result, 3)
+		require.Equal(t, "system", result[0].Role)
+		require.Contains(t, result[0].Content, "[Summary]")
+		require.Contains(t, result[0].Content, "Message 1") // compacted content
+		require.Equal(t, "Message 3", result[1].Content)    // kept recent
+		require.Equal(t, "Response 3", result[2].Content)   // kept recent
+	})
+
+	t.Run("preserves all when below threshold", func(t *testing.T) {
+		config := ContextManagerConfig{
+			CompactionInterval:        10, // high interval, won't trigger
+			OverlapSize:               2,
+			PreserveLastN:             2,
+			TokenEstimateRatio:        4.0,
+			CompactionSummaryTemplate: "{summary}",
+		}
+		messages := []Message{
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "Hi!"},
+		}
+		result := applyCompactionStrategy(messages, config)
+		require.Len(t, result, 2) // unchanged
+	})
+
+	t.Run("triggers compaction on token threshold", func(t *testing.T) {
+		config := ContextManagerConfig{
+			TokenThreshold:            10,
+			OverlapSize:               1,
+			PreserveLastN:             1,
+			TokenEstimateRatio:        4.0,
+			CompactionSummaryTemplate: "{summary}",
+		}
+		messages := []Message{
+			{Role: "user", Content: "This is a long message with many words"},
+			{Role: "assistant", Content: "This is a long response with many words"},
+			{Role: "user", Content: "Another long message here too"},
+		}
+		result := applyCompactionStrategy(messages, config)
+		require.Len(t, result, 2) // 1 summary + 1 recent
+		require.Equal(t, "system", result[0].Role)
+		require.Equal(t, "Another long message here too", result[1].Content)
+	})
+
+	t.Run("overlap size determines recent messages kept", func(t *testing.T) {
+		config := ContextManagerConfig{
+			CompactionInterval:        2,
+			OverlapSize:               3,
+			PreserveLastN:             1,
+			TokenEstimateRatio:        4.0,
+			CompactionSummaryTemplate: "{summary}",
+		}
+		messages := []Message{
+			{Role: "user", Content: "Msg 1"},
+			{Role: "assistant", Content: "Resp 1"},
+			{Role: "user", Content: "Msg 2"},
+			{Role: "assistant", Content: "Resp 2"},
+			{Role: "user", Content: "Msg 3"},
+		}
+		result := applyCompactionStrategy(messages, config)
+		// overlap_size=3, so keep last 3: Resp 2, Msg 3 + summary of earlier
+		require.Len(t, result, 4) // 1 summary + 3 overlap
+		require.Equal(t, "system", result[0].Role)
+	})
+
+	t.Run("empty messages returns empty", func(t *testing.T) {
+		config := ContextManagerConfig{
+			CompactionInterval: 3,
+		}
+		result := applyCompactionStrategy([]Message{}, config)
+		require.Len(t, result, 0)
+	})
+
+	t.Run("not enough messages to compact returns original", func(t *testing.T) {
+		config := ContextManagerConfig{
+			CompactionInterval: 1,
+			OverlapSize:        5, // overlap larger than message count
+			PreserveLastN:      5,
+		}
+		messages := []Message{
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "Hi!"},
+		}
+		result := applyCompactionStrategy(messages, config)
+		require.Len(t, result, 2) // unchanged, can't compact
+	})
+}
+
+func TestManageContextWithCompaction(t *testing.T) {
+	t.Run("compaction strategy with system message", func(t *testing.T) {
+		config := ContextManagerConfig{
+			PreserveSystemMessage:     true,
+			SummarizeStrategy:         "compaction",
+			CompactionInterval:        2,
+			OverlapSize:               1,
+			PreserveLastN:             1,
+			TokenEstimateRatio:        4.0,
+			CompactionSummaryTemplate: "[Summary]\n{summary}",
+		}
+		messages := []Message{
+			{Role: "system", Content: "You are helpful"},
+			{Role: "user", Content: "Message 1"},
+			{Role: "assistant", Content: "Response 1"},
+			{Role: "user", Content: "Message 2"},
+			{Role: "assistant", Content: "Response 2"},
+		}
+		result := manageContext(messages, config)
+
+		// Should have: system + summary + 1 recent
+		require.True(t, len(result) >= 2)
+		require.Equal(t, "system", result[0].Role)
+		require.Equal(t, "You are helpful", result[0].Content) // preserved original system
+		// Last message should be the most recent
+		require.Equal(t, "Response 2", result[len(result)-1].Content)
+	})
+
+	t.Run("compaction with no limits set but strategy is compaction", func(t *testing.T) {
+		config := ContextManagerConfig{
+			PreserveSystemMessage:     true,
+			SummarizeStrategy:         "compaction",
+			CompactionInterval:        2,
+			OverlapSize:               1,
+			PreserveLastN:             1,
+			TokenEstimateRatio:        4.0,
+			CompactionSummaryTemplate: "{summary}",
+		}
+		messages := []Message{
+			{Role: "user", Content: "Msg 1"},
+			{Role: "assistant", Content: "Resp 1"},
+			{Role: "user", Content: "Msg 2"},
+		}
+		result := manageContext(messages, config)
+		// Even with max_messages=0 and max_tokens=0, compaction strategy should work
+		// because compaction_interval=2 and we have 2 user turns
+		require.True(t, len(result) < len(messages))
+	})
+}
+
+func TestBuildScopeKey(t *testing.T) {
+	t.Run("builds session scope key", func(t *testing.T) {
+		key := buildScopeKey("session", "data")
+		require.Equal(t, "session:data", key)
+	})
+
+	t.Run("builds user scope key", func(t *testing.T) {
+		key := buildScopeKey("user", "preferences")
+		require.Equal(t, "user:preferences", key)
+	})
+
+	t.Run("builds app scope key", func(t *testing.T) {
+		key := buildScopeKey("app", "config")
+		require.Equal(t, "app:config", key)
+	})
+
+	t.Run("defaults to session when empty", func(t *testing.T) {
+		key := buildScopeKey("", "data")
+		require.Equal(t, "session:data", key)
+	})
+}
+
+func TestOnHttpRequestBodyCompaction(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		t.Run("compaction strategy reduces messages", func(t *testing.T) {
+			host, status := test.NewTestHost(compactionConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/chat/completions"},
+				{":method", "POST"},
+			})
+
+			body := `{
+				"model": "gpt-4",
+				"messages": [
+					{"role": "system", "content": "You are helpful"},
+					{"role": "user", "content": "Message 1"},
+					{"role": "assistant", "content": "Response 1"},
+					{"role": "user", "content": "Message 2"},
+					{"role": "assistant", "content": "Response 2"},
+					{"role": "user", "content": "Message 3"},
+					{"role": "assistant", "content": "Response 3"},
+					{"role": "user", "content": "Current question"}
+				]
+			}`
+			action := host.CallOnHttpRequestBody([]byte(body))
+			require.Equal(t, types.ActionContinue, action)
+
+			modifiedBody := host.GetRequestBody()
+			require.NotEmpty(t, modifiedBody)
+
+			messages := gjson.GetBytes(modifiedBody, "messages")
+			require.True(t, messages.Exists())
+
+			// With compaction (interval=3, overlap=2), messages should be compressed
+			msgArray := messages.Array()
+			require.Less(t, len(msgArray), 9) // should be fewer than original 9 messages
+
+			// First message should still be system
+			require.Equal(t, "system", msgArray[0].Get("role").String())
+			require.Equal(t, "You are helpful", msgArray[0].Get("content").String())
+
+			// Last message should be the most recent user message
+			lastMsg := msgArray[len(msgArray)-1]
+			require.Equal(t, "Current question", lastMsg.Get("content").String())
+		})
+	})
+}
