@@ -681,9 +681,22 @@ func ensureTurnPairIntegrity(messages []Message) []Message {
 
 // isToolMessage checks if a message is a tool call or tool result
 func isToolMessage(msg Message) bool {
-	return msg.Role == "tool" || msg.Role == "function" ||
-		msg.ToolCalls != nil || msg.ToolCallID != "" ||
-		msg.FunctionCall != nil
+	if msg.Role == "tool" || msg.Role == "function" ||
+		msg.ToolCallID != "" {
+		return true
+	}
+	// Check ToolCalls: non-nil and non-empty
+	if msg.ToolCalls != nil {
+		if arr, ok := msg.ToolCalls.([]interface{}); ok {
+			return len(arr) > 0
+		}
+		return true // non-slice type, still counts
+	}
+	// Check FunctionCall: non-nil
+	if msg.FunctionCall != nil {
+		return true
+	}
+	return false
 }
 
 // onHttpResponseHeaders processes response headers for context tracking

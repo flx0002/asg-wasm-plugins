@@ -1104,7 +1104,11 @@ func TestIsToolMessage(t *testing.T) {
 	})
 
 	t.Run("identifies tool_calls field", func(t *testing.T) {
-		require.True(t, isToolMessage(Message{Role: "assistant", ToolCalls: []interface{}{}}))
+		require.True(t, isToolMessage(Message{Role: "assistant", ToolCalls: []interface{}{map[string]interface{}{"id": "call_1"}}}))
+	})
+
+	t.Run("empty tool_calls is not tool message", func(t *testing.T) {
+		require.False(t, isToolMessage(Message{Role: "assistant", ToolCalls: []interface{}{}}))
 	})
 
 	t.Run("identifies tool_call_id field", func(t *testing.T) {
