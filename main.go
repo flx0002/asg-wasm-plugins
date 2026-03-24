@@ -17,6 +17,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
@@ -64,7 +65,7 @@ type ContextManagerConfig struct {
 	PreserveSystemMessage bool `json:"preserve_system_message"`
 	// PreserveLastN keeps the last N messages regardless of limits
 	PreserveLastN int `json:"preserve_last_n"`
-	// SummarizeStrategy defines how to manage context: "truncate", "sliding_window", or "compaction"
+	// SummarizeStrategy defines how to manage context: "truncate", "sliding_window", "compaction", or "llm_summary"
 	SummarizeStrategy string `json:"summarize_strategy"`
 	// TokenEstimateRatio is the approximate characters per token ratio
 	TokenEstimateRatio float64 `json:"token_estimate_ratio"`
@@ -124,6 +125,34 @@ type ContextManagerConfig struct {
 	// TrackTokenUsage enables response processing to extract and forward
 	// token usage metadata from model responses.
 	TrackTokenUsage bool `json:"track_token_usage"`
+
+	// --- LLM-based Summary (Google ADK LlmEventSummarizer inspired) ---
+
+	// LLMSummary contains configuration for LLM-based context summarization
+	LLMSummary LLMSummaryConfig `json:"llm_summary"`
+}
+
+// LLMSummaryConfig contains configuration for LLM-based context summarization
+type LLMSummaryConfig struct {
+	// ServiceName is the DNS service name for the LLM API endpoint
+	ServiceName string `json:"service_name"`
+	// Model is the model name to use for summarization
+	Model string `json:"model"`
+	// APIKey is the API key for authentication
+	APIKey string `json:"api_key"`
+	// SummaryPrefix is the prefix for the generated summary
+	SummaryPrefix string `json:"summary_prefix"`
+	// MaxSummaryTokens is the maximum tokens for the generated summary
+	MaxSummaryTokens int `json:"max_summary_tokens"`
+	// SummaryPromptTemplate is the prompt template for generating summaries
+	// Available placeholders: {conversation}
+	SummaryPromptTemplate string `json:"summary_prompt_template"`
+	// Timeout is the timeout for LLM API calls in milliseconds
+	Timeout uint32 `json:"timeout"`
+	// FallbackStrategy is the strategy to use when LLM summary fails: "extractive" or "truncate"
+	FallbackStrategy string `json:"fallback_strategy"`
+	// client is the HTTP client for LLM API calls
+	client wrapper.HttpClient
 }
 
 func parseConfig(json gjson.Result, config *ContextManagerConfig) error {
@@ -245,6 +274,44 @@ func parseConfig(json gjson.Result, config *ContextManagerConfig) error {
 		config.TrackTokenUsage = json.Get("track_token_usage").Bool()
 	}
 
+	// Parse llm_summary configuration
+	llmSummaryJson := json.Get("llm_summary")
+	if llmSummaryJson.Exists() {
+		config.LLMSummary = LLMSummaryConfig{
+			ServiceName:           llmSummaryJson.Get("service_name").String(),
+			Model:                 llmSummaryJson.Get("model").String(),
+			APIKey:                llmSummaryJson.Get("api_key").String(),
+			SummaryPrefix:         llmSummaryJson.Get("summary_prefix").String(),
+			MaxSummaryTokens:      int(llmSummaryJson.Get("max_summary_tokens").Int()),
+			SummaryPromptTemplate: llmSummaryJson.Get("summary_prompt_template").String(),
+			Timeout:               uint32(llmSummaryJson.Get("timeout").Uint()),
+			FallbackStrategy:      llmSummaryJson.Get("fallback_strategy").String(),
+		}
+		// Set defaults for llm_summary
+		if config.LLMSummary.SummaryPrefix == "" {
+			config.LLMSummary.SummaryPrefix = "[对话摘要] "
+		}
+		if config.LLMSummary.MaxSummaryTokens == 0 {
+			config.LLMSummary.MaxSummaryTokens = 500
+		}
+		if config.LLMSummary.SummaryPromptTemplate == "" {
+			config.LLMSummary.SummaryPromptTemplate = "请对以下对话历史进行简洁的总结，保留关键信息和上下文：\n\n{conversation}\n\n请用简洁的语言总结上述对话的主要内容和关键信息。"
+		}
+		if config.LLMSummary.Timeout == 0 {
+			config.LLMSummary.Timeout = 30000
+		}
+		if config.LLMSummary.FallbackStrategy == "" {
+			config.LLMSummary.FallbackStrategy = "extractive"
+		}
+		// Initialize HTTP client for LLM API calls
+		if config.LLMSummary.ServiceName != "" {
+			config.LLMSummary.client = wrapper.NewClusterClient(wrapper.DnsCluster{
+				ServiceName: config.LLMSummary.ServiceName,
+				Port:        443,
+			})
+		}
+	}
+
 	return nil
 }
 
@@ -322,8 +389,63 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config ContextManagerConfig, bod
 		}
 	}
 
+	// Log context before processing
+	beforeMsgCount := len(msgList)
+	beforeTokens := estimateTotalTokens(msgList, config.TokenEstimateRatio)
+	log.Debugf("[ContextManager] Before: strategy=%s, messages=%d, estimated_tokens=%d",
+		config.SummarizeStrategy, beforeMsgCount, beforeTokens)
+
+	// Log message details for debugging (first 5 messages)
+	if beforeMsgCount > 0 {
+		log.Debugf("[ContextManager] Message breakdown:")
+		for i, msg := range msgList {
+			if i >= 5 {
+				log.Debugf("[ContextManager]   ... and %d more messages", beforeMsgCount-5)
+				break
+			}
+			contentPreview := truncateString(msg.Content, 50)
+			log.Debugf("[ContextManager]   [%d] role=%s, content=%s", i, msg.Role, contentPreview)
+		}
+	}
+
+	// Check if LLM summary strategy should be applied
+	if shouldApplyLLMSummary(msgList, config) {
+		return handleLLMSummary(ctx, config, body, msgList, beforeMsgCount, beforeTokens)
+	}
+
 	// Apply context management
 	processedMessages := manageContext(msgList, config)
+
+	// Log context after processing
+	afterMsgCount := len(processedMessages)
+	afterTokens := estimateTotalTokens(processedMessages, config.TokenEstimateRatio)
+	msgReduction := beforeMsgCount - afterMsgCount
+	tokenReduction := beforeTokens - afterTokens
+	tokenReductionPercent := float64(0)
+	if beforeTokens > 0 {
+		tokenReductionPercent = float64(tokenReduction) / float64(beforeTokens) * 100
+	}
+
+	log.Infof("[ContextManager] Processed: strategy=%s, messages=%d->%d (reduced %d), tokens=%d->%d (reduced %d, %.1f%%)",
+		config.SummarizeStrategy, beforeMsgCount, afterMsgCount, msgReduction,
+		beforeTokens, afterTokens, tokenReduction, tokenReductionPercent)
+
+	// Store context stats for observability (for ai-statistics integration)
+	ctx.SetContext("context_before_messages", itoa(beforeMsgCount))
+	ctx.SetContext("context_after_messages", itoa(afterMsgCount))
+	ctx.SetContext("context_before_tokens", itoa(beforeTokens))
+	ctx.SetContext("context_after_tokens", itoa(afterTokens))
+	ctx.SetContext("context_strategy", config.SummarizeStrategy)
+	ctx.SetContext("context_msg_reduction", itoa(msgReduction))
+	ctx.SetContext("context_token_reduction", itoa(tokenReduction))
+
+	// Set user attributes for ai-statistics integration
+	ctx.SetUserAttribute("context_strategy", config.SummarizeStrategy)
+	ctx.SetUserAttribute("context_before_messages", itoa(beforeMsgCount))
+	ctx.SetUserAttribute("context_after_messages", itoa(afterMsgCount))
+	ctx.SetUserAttribute("context_before_tokens", itoa(beforeTokens))
+	ctx.SetUserAttribute("context_after_tokens", itoa(afterTokens))
+	ctx.SetUserAttribute("context_token_reduction", itoa(tokenReduction))
 
 	// Rebuild request body with processed messages
 	if len(processedMessages) != len(msgList) || hasContentChanged(msgList, processedMessages) {
@@ -338,6 +460,150 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config ContextManagerConfig, bod
 		}
 	}
 
+	return types.ActionContinue
+}
+
+// handleLLMSummary handles the LLM-based summarization strategy with async HTTP call
+func handleLLMSummary(ctx wrapper.HttpContext, config ContextManagerConfig, originalBody []byte, msgList []Message, beforeMsgCount, beforeTokens int) types.Action {
+	// Get messages to compact
+	messagesToCompact := getMessagesToCompact(msgList, config)
+	if len(messagesToCompact) == 0 {
+		log.Debugf("[ContextManager] No messages to compact")
+		return types.ActionContinue
+	}
+
+	// Log messages being compacted
+	compactTokens := estimateTotalTokens(messagesToCompact, config.TokenEstimateRatio)
+	log.Debugf("[ContextManager] LLM Summary: compacting %d messages (%d tokens), keeping %d recent",
+		len(messagesToCompact), compactTokens, len(msgList)-len(messagesToCompact))
+
+	// Build LLM request
+	llmReqBody, err := buildLLMSummaryRequest(messagesToCompact, config.LLMSummary)
+	if err != nil {
+		log.Errorf("Failed to build LLM summary request: %v", err)
+		// Fallback to extractive summary
+		processedMessages := applyLLMSummaryStrategy(msgList, config, "")
+		afterTokens := estimateTotalTokens(processedMessages, config.TokenEstimateRatio)
+		log.Debugf("[ContextManager] Fallback (extractive): messages=%d->%d, tokens=%d->%d",
+			beforeMsgCount, len(processedMessages), beforeTokens, afterTokens)
+		return finalizeRequest(ctx, originalBody, msgList, processedMessages)
+	}
+
+	// Prepare headers
+	headers := [][2]string{
+		{"Content-Type", "application/json"},
+		{"Authorization", "Bearer " + config.LLMSummary.APIKey},
+	}
+
+	// Store original body and messages for callback
+	ctx.SetContext("original_body", originalBody)
+	ctx.SetContext("msg_list", msgList)
+	ctx.SetContext("before_msg_count", beforeMsgCount)
+	ctx.SetContext("before_tokens", beforeTokens)
+
+	// Make async HTTP call to LLM API
+	config.LLMSummary.client.Post(
+		"/v1/chat/completions",
+		headers,
+		llmReqBody,
+		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			defer proxywasm.ResumeHttpRequest()
+
+			var llmSummary string
+			var summaryMethod string
+			if statusCode == 200 && len(responseBody) > 0 {
+				summary, err := parseLLMSummaryResponse(responseBody)
+				if err != nil {
+					log.Warnf("[ContextManager] Failed to parse LLM summary response: %v, using fallback", err)
+					summaryMethod = "fallback_extractive"
+				} else {
+					llmSummary = summary
+					summaryMethod = "llm_generated"
+					log.Debugf("[ContextManager] LLM summary generated: length=%d, preview=%s",
+						len(llmSummary), truncateString(llmSummary, 100))
+				}
+			} else {
+				log.Warnf("[ContextManager] LLM summary API returned status %d, using fallback", statusCode)
+				summaryMethod = "fallback_extractive"
+			}
+
+			// Get stored context
+			originalBody, _ := ctx.GetContext("original_body").([]byte)
+			msgList, _ := ctx.GetContext("msg_list").([]Message)
+			beforeMsgCount, _ := ctx.GetContext("before_msg_count").(int)
+			beforeTokens, _ := ctx.GetContext("before_tokens").(int)
+
+			// Apply LLM summary strategy (with fallback if llmSummary is empty)
+			processedMessages := applyLLMSummaryStrategy(msgList, config, llmSummary)
+
+			// Calculate and log results
+			afterMsgCount := len(processedMessages)
+			afterTokens := estimateTotalTokens(processedMessages, config.TokenEstimateRatio)
+			msgReduction := beforeMsgCount - afterMsgCount
+			tokenReduction := beforeTokens - afterTokens
+			tokenReductionPercent := float64(0)
+			if beforeTokens > 0 {
+				tokenReductionPercent = float64(tokenReduction) / float64(beforeTokens) * 100
+			}
+
+			log.Infof("[ContextManager] LLM Summary complete: method=%s, messages=%d->%d (reduced %d), tokens=%d->%d (reduced %d, %.1f%%), summary_len=%d",
+				summaryMethod, beforeMsgCount, afterMsgCount, msgReduction,
+				beforeTokens, afterTokens, tokenReduction, tokenReductionPercent, len(llmSummary))
+
+			// Store stats for observability (for ai-statistics integration)
+			ctx.SetContext("context_summary_method", summaryMethod)
+			ctx.SetContext("context_before_messages", itoa(beforeMsgCount))
+			ctx.SetContext("context_after_messages", itoa(afterMsgCount))
+			ctx.SetContext("context_before_tokens", itoa(beforeTokens))
+			ctx.SetContext("context_after_tokens", itoa(afterTokens))
+			ctx.SetContext("context_reduction_tokens", itoa(tokenReduction))
+			ctx.SetContext("context_msg_reduction", itoa(msgReduction))
+			ctx.SetContext("context_token_reduction", itoa(tokenReduction))
+			ctx.SetContext("context_summary_length", itoa(len(llmSummary)))
+			ctx.SetContext("context_strategy", "llm_summary")
+
+			// Set user attributes for ai-statistics integration
+			ctx.SetUserAttribute("context_strategy", "llm_summary")
+			ctx.SetUserAttribute("context_summary_method", summaryMethod)
+			ctx.SetUserAttribute("context_before_messages", itoa(beforeMsgCount))
+			ctx.SetUserAttribute("context_after_messages", itoa(afterMsgCount))
+			ctx.SetUserAttribute("context_before_tokens", itoa(beforeTokens))
+			ctx.SetUserAttribute("context_after_tokens", itoa(afterTokens))
+			ctx.SetUserAttribute("context_token_reduction", itoa(tokenReduction))
+			ctx.SetUserAttribute("context_summary_length", itoa(len(llmSummary)))
+
+			// Rebuild and replace request body
+			if len(processedMessages) != len(msgList) || hasContentChanged(msgList, processedMessages) {
+				newBody, err := rebuildRequestBody(originalBody, processedMessages)
+				if err != nil {
+					log.Errorf("Failed to rebuild request body: %v", err)
+					return
+				}
+
+				if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+					log.Errorf("Failed to replace request body: %v", err)
+				}
+			}
+		},
+		config.LLMSummary.Timeout,
+	)
+
+	return types.ActionPause
+}
+
+// finalizeRequest finalizes the request with processed messages
+func finalizeRequest(ctx wrapper.HttpContext, originalBody []byte, msgList, processedMessages []Message) types.Action {
+	if len(processedMessages) != len(msgList) || hasContentChanged(msgList, processedMessages) {
+		newBody, err := rebuildRequestBody(originalBody, processedMessages)
+		if err != nil {
+			log.Errorf("Failed to rebuild request body: %v", err)
+			return types.ActionContinue
+		}
+
+		if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+			log.Errorf("Failed to replace request body: %v", err)
+		}
+	}
 	return types.ActionContinue
 }
 
@@ -711,11 +977,39 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config ContextManagerConfig)
 		}
 	}
 
+	// Add context management statistics headers for observability
+	if beforeMsgs, ok := ctx.GetContext("context_before_messages").(string); ok {
+		proxywasm.AddHttpResponseHeader("x-context-before-messages", beforeMsgs)
+	}
+	if afterMsgs, ok := ctx.GetContext("context_after_messages").(string); ok {
+		proxywasm.AddHttpResponseHeader("x-context-after-messages", afterMsgs)
+	}
+	if beforeTokens, ok := ctx.GetContext("context_before_tokens").(string); ok {
+		proxywasm.AddHttpResponseHeader("x-context-before-tokens", beforeTokens)
+	}
+	if afterTokens, ok := ctx.GetContext("context_after_tokens").(string); ok {
+		proxywasm.AddHttpResponseHeader("x-context-after-tokens", afterTokens)
+	}
+	if strategy, ok := ctx.GetContext("context_strategy").(string); ok {
+		proxywasm.AddHttpResponseHeader("x-context-strategy", strategy)
+	}
+	if summaryMethod, ok := ctx.GetContext("context_summary_method").(string); ok {
+		proxywasm.AddHttpResponseHeader("x-context-summary-method", summaryMethod)
+	}
+	if reduction, ok := ctx.GetContext("context_token_reduction").(string); ok {
+		proxywasm.AddHttpResponseHeader("x-context-token-reduction", reduction)
+	}
+	if msgReduction, ok := ctx.GetContext("context_msg_reduction").(string); ok {
+		proxywasm.AddHttpResponseHeader("x-context-msg-reduction", msgReduction)
+	}
+	if summaryLength, ok := ctx.GetContext("context_summary_length").(string); ok {
+		proxywasm.AddHttpResponseHeader("x-context-summary-length", summaryLength)
+	}
+
 	// Buffer response body if we need to track token usage
 	if config.TrackTokenUsage {
 		ctx.BufferResponseBody()
 	}
-
 	return types.ActionContinue
 }
 
@@ -831,4 +1125,129 @@ func itoa(i int) string {
 		return "-" + string(reversed)
 	}
 	return string(reversed)
+}
+
+// buildConversationText converts messages to a conversation text format
+func buildConversationText(messages []Message) string {
+	var parts []string
+	for _, msg := range messages {
+		roleLabel := msg.Role
+		switch msg.Role {
+		case "user":
+			roleLabel = "用户"
+		case "assistant":
+			roleLabel = "助手"
+		case "system":
+			roleLabel = "系统"
+		}
+		content := msg.Content
+		if len(content) > 500 {
+			content = content[:500] + "..."
+		}
+		parts = append(parts, fmt.Sprintf("[%s]: %s", roleLabel, content))
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// buildLLMSummaryRequest builds the request body for LLM summarization API
+func buildLLMSummaryRequest(messages []Message, config LLMSummaryConfig) ([]byte, error) {
+	conversation := buildConversationText(messages)
+	prompt := strings.Replace(config.SummaryPromptTemplate, "{conversation}", conversation, 1)
+
+	request := map[string]interface{}{
+		"model": config.Model,
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
+		"max_tokens": config.MaxSummaryTokens,
+	}
+
+	return json.Marshal(request)
+}
+
+// parseLLMSummaryResponse extracts the summary from LLM API response
+func parseLLMSummaryResponse(body []byte) (string, error) {
+	content := gjson.GetBytes(body, "choices.0.message.content").String()
+	if content == "" {
+		return "", fmt.Errorf("no content in LLM response")
+	}
+	return content, nil
+}
+
+// applyLLMSummaryStrategy applies LLM-based summarization strategy
+// This function is called synchronously and returns the result with the summary
+// If LLM call fails, it falls back to extractive summarization
+func applyLLMSummaryStrategy(messages []Message, config ContextManagerConfig, llmSummary string) []Message {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	keepRecent := config.OverlapSize
+	if config.PreserveLastN > keepRecent {
+		keepRecent = config.PreserveLastN
+	}
+
+	if len(messages) <= keepRecent {
+		return messages
+	}
+
+	compactBoundary := len(messages) - keepRecent
+	messagesToCompact := messages[:compactBoundary]
+	messagesToKeep := messages[compactBoundary:]
+
+	var summary Message
+	if llmSummary != "" {
+		summary = Message{
+			Role:    "system",
+			Content: config.LLMSummary.SummaryPrefix + llmSummary,
+		}
+	} else {
+		summary = compactMessages(messagesToCompact, config.CompactionSummaryTemplate)
+	}
+
+	result := make([]Message, 0, 1+len(messagesToKeep))
+	result = append(result, summary)
+	result = append(result, messagesToKeep...)
+
+	return result
+}
+
+// shouldApplyLLMSummary checks if LLM summary should be applied
+func shouldApplyLLMSummary(messages []Message, config ContextManagerConfig) bool {
+	if config.SummarizeStrategy != "llm_summary" {
+		return false
+	}
+	if config.LLMSummary.ServiceName == "" || config.LLMSummary.Model == "" {
+		return false
+	}
+	return shouldCompact(messages, config)
+}
+
+// getMessagesToCompact returns the messages that need to be compacted for LLM summary
+func getMessagesToCompact(messages []Message, config ContextManagerConfig) []Message {
+	if len(messages) == 0 {
+		return nil
+	}
+
+	keepRecent := config.OverlapSize
+	if config.PreserveLastN > keepRecent {
+		keepRecent = config.PreserveLastN
+	}
+
+	if len(messages) <= keepRecent {
+		return nil
+	}
+
+	compactBoundary := len(messages) - keepRecent
+	return messages[:compactBoundary]
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return "..."
+	}
+	return s[:maxLen-3] + "..."
 }

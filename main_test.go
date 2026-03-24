@@ -1236,3 +1236,349 @@ func TestToolMessageHandling(t *testing.T) {
 		require.Len(t, result, 6)
 	})
 }
+
+// --- Tests for LLM Summary feature ---
+
+var llmSummaryConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"summarize_strategy":  "llm_summary",
+		"compaction_interval": 2,
+		"overlap_size":        2,
+		"preserve_last_n":     2,
+		"llm_summary": map[string]interface{}{
+			"service_name":      "llm-service.internal",
+			"model":             "gpt-4",
+			"api_key":           "test-api-key",
+			"summary_prefix":    "[摘要] ",
+			"max_summary_tokens": 500,
+			"timeout":           30000,
+			"fallback_strategy": "extractive",
+		},
+	})
+	return data
+}()
+
+func TestParseConfigLLMSummary(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		t.Run("parse llm_summary config", func(t *testing.T) {
+			host, status := test.NewTestHost(llmSummaryConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			config, err := host.GetMatchConfig()
+			require.NoError(t, err)
+			require.NotNil(t, config)
+
+			ctxConfig := config.(*ContextManagerConfig)
+			require.Equal(t, "llm_summary", ctxConfig.SummarizeStrategy)
+			require.Equal(t, "llm-service.internal", ctxConfig.LLMSummary.ServiceName)
+			require.Equal(t, "gpt-4", ctxConfig.LLMSummary.Model)
+			require.Equal(t, "test-api-key", ctxConfig.LLMSummary.APIKey)
+			require.Equal(t, "[摘要] ", ctxConfig.LLMSummary.SummaryPrefix)
+			require.Equal(t, 500, ctxConfig.LLMSummary.MaxSummaryTokens)
+			require.Equal(t, uint32(30000), ctxConfig.LLMSummary.Timeout)
+			require.Equal(t, "extractive", ctxConfig.LLMSummary.FallbackStrategy)
+		})
+
+		t.Run("llm_summary defaults are applied", func(t *testing.T) {
+			minimalConfig := func() json.RawMessage {
+				data, _ := json.Marshal(map[string]interface{}{
+					"summarize_strategy": "llm_summary",
+					"llm_summary": map[string]interface{}{
+						"service_name": "llm-service",
+						"model":        "gpt-4",
+						"api_key":      "key",
+					},
+				})
+				return data
+			}()
+			host, status := test.NewTestHost(minimalConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			config, err := host.GetMatchConfig()
+			require.NoError(t, err)
+			require.NotNil(t, config)
+
+			ctxConfig := config.(*ContextManagerConfig)
+			require.Equal(t, "[对话摘要] ", ctxConfig.LLMSummary.SummaryPrefix)
+			require.Equal(t, 500, ctxConfig.LLMSummary.MaxSummaryTokens)
+			require.Equal(t, uint32(30000), ctxConfig.LLMSummary.Timeout)
+			require.Equal(t, "extractive", ctxConfig.LLMSummary.FallbackStrategy)
+		})
+	})
+}
+
+func TestBuildConversationText(t *testing.T) {
+	t.Run("builds conversation text from messages", func(t *testing.T) {
+		messages := []Message{
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "Hi there!"},
+			{Role: "user", Content: "How are you?"},
+		}
+		text := buildConversationText(messages)
+		require.Contains(t, text, "[用户]: Hello")
+		require.Contains(t, text, "[助手]: Hi there!")
+		require.Contains(t, text, "[用户]: How are you?")
+	})
+
+	t.Run("truncates long messages", func(t *testing.T) {
+		longContent := strings.Repeat("a", 600)
+		messages := []Message{
+			{Role: "user", Content: longContent},
+		}
+		text := buildConversationText(messages)
+		require.Contains(t, text, "...")
+		require.LessOrEqual(t, len(text), 600)
+	})
+}
+
+func TestBuildLLMSummaryRequest(t *testing.T) {
+	t.Run("builds valid request body", func(t *testing.T) {
+		messages := []Message{
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "Hi!"},
+		}
+		config := LLMSummaryConfig{
+			Model:                 "gpt-4",
+			MaxSummaryTokens:      500,
+			SummaryPromptTemplate: "Summarize: {conversation}",
+		}
+
+		body, err := buildLLMSummaryRequest(messages, config)
+		require.NoError(t, err)
+		require.NotNil(t, body)
+
+		result := gjson.ParseBytes(body)
+		require.Equal(t, "gpt-4", result.Get("model").String())
+		require.Equal(t, int64(500), result.Get("max_tokens").Int())
+		require.True(t, result.Get("messages").Exists())
+	})
+
+	t.Run("replaces conversation placeholder", func(t *testing.T) {
+		messages := []Message{
+			{Role: "user", Content: "Test message"},
+		}
+		config := LLMSummaryConfig{
+			Model:                 "gpt-4",
+			SummaryPromptTemplate: "Context:\n{conversation}\nPlease summarize.",
+		}
+
+		body, err := buildLLMSummaryRequest(messages, config)
+		require.NoError(t, err)
+
+		result := gjson.ParseBytes(body)
+		content := result.Get("messages.0.content").String()
+		require.Contains(t, content, "Test message")
+		require.Contains(t, content, "Please summarize.")
+	})
+}
+
+func TestParseLLMSummaryResponse(t *testing.T) {
+	t.Run("extracts content from valid response", func(t *testing.T) {
+		response := `{
+			"choices": [
+				{
+					"message": {
+						"role": "assistant",
+						"content": "This is a summary of the conversation."
+					}
+				}
+			]
+		}`
+		summary, err := parseLLMSummaryResponse([]byte(response))
+		require.NoError(t, err)
+		require.Equal(t, "This is a summary of the conversation.", summary)
+	})
+
+	t.Run("returns error for empty content", func(t *testing.T) {
+		response := `{
+			"choices": [
+				{
+					"message": {
+						"role": "assistant",
+						"content": ""
+					}
+				}
+			]
+		}`
+		_, err := parseLLMSummaryResponse([]byte(response))
+		require.Error(t, err)
+	})
+
+	t.Run("returns error for missing content", func(t *testing.T) {
+		response := `{
+			"choices": []
+		}`
+		_, err := parseLLMSummaryResponse([]byte(response))
+		require.Error(t, err)
+	})
+}
+
+func TestApplyLLMSummaryStrategy(t *testing.T) {
+	t.Run("applies LLM summary when provided", func(t *testing.T) {
+		config := ContextManagerConfig{
+			OverlapSize:   2,
+			PreserveLastN: 2,
+			LLMSummary: LLMSummaryConfig{
+				SummaryPrefix: "[摘要] ",
+			},
+		}
+		messages := []Message{
+			{Role: "user", Content: "Message 1"},
+			{Role: "assistant", Content: "Response 1"},
+			{Role: "user", Content: "Message 2"},
+			{Role: "assistant", Content: "Response 2"},
+			{Role: "user", Content: "Message 3"},
+		}
+		llmSummary := "用户询问了几个问题，助手提供了相应的回答。"
+		result := applyLLMSummaryStrategy(messages, config, llmSummary)
+
+		require.Len(t, result, 3) // 1 summary + 2 recent
+		require.Equal(t, "system", result[0].Role)
+		require.Contains(t, result[0].Content, "[摘要] ")
+		require.Contains(t, result[0].Content, "用户询问了几个问题")
+	})
+
+	t.Run("falls back to extractive when no LLM summary", func(t *testing.T) {
+		config := ContextManagerConfig{
+			OverlapSize:               1,
+			PreserveLastN:             1,
+			CompactionSummaryTemplate: "[Summary] {summary}",
+		}
+		messages := []Message{
+			{Role: "user", Content: "Message 1"},
+			{Role: "assistant", Content: "Response 1"},
+			{Role: "user", Content: "Message 2"},
+		}
+		result := applyLLMSummaryStrategy(messages, config, "")
+
+		require.Len(t, result, 2) // 1 summary + 1 recent
+		require.Equal(t, "system", result[0].Role)
+		require.Contains(t, result[0].Content, "[Summary]")
+	})
+
+	t.Run("returns original when not enough messages", func(t *testing.T) {
+		config := ContextManagerConfig{
+			OverlapSize:   5,
+			PreserveLastN: 5,
+		}
+		messages := []Message{
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "Hi!"},
+		}
+		result := applyLLMSummaryStrategy(messages, config, "summary")
+		require.Len(t, result, 2) // unchanged
+	})
+}
+
+func TestShouldApplyLLMSummary(t *testing.T) {
+	t.Run("returns true when all conditions met", func(t *testing.T) {
+		config := ContextManagerConfig{
+			SummarizeStrategy:    "llm_summary",
+			CompactionInterval:   2,
+			TokenEstimateRatio:   4.0,
+			LLMSummary: LLMSummaryConfig{
+				ServiceName: "llm-service",
+				Model:       "gpt-4",
+			},
+		}
+		messages := []Message{
+			{Role: "user", Content: "Message 1"},
+			{Role: "assistant", Content: "Response 1"},
+			{Role: "user", Content: "Message 2"},
+			{Role: "assistant", Content: "Response 2"},
+		}
+		require.True(t, shouldApplyLLMSummary(messages, config))
+	})
+
+	t.Run("returns false when strategy is not llm_summary", func(t *testing.T) {
+		config := ContextManagerConfig{
+			SummarizeStrategy:  "sliding_window",
+			CompactionInterval: 2,
+			LLMSummary: LLMSummaryConfig{
+				ServiceName: "llm-service",
+				Model:       "gpt-4",
+			},
+		}
+		messages := []Message{
+			{Role: "user", Content: "Message 1"},
+			{Role: "assistant", Content: "Response 1"},
+		}
+		require.False(t, shouldApplyLLMSummary(messages, config))
+	})
+
+	t.Run("returns false when service_name is empty", func(t *testing.T) {
+		config := ContextManagerConfig{
+			SummarizeStrategy:    "llm_summary",
+			CompactionInterval:   2,
+			TokenEstimateRatio:   4.0,
+			LLMSummary: LLMSummaryConfig{
+				ServiceName: "",
+				Model:       "gpt-4",
+			},
+		}
+		messages := []Message{
+			{Role: "user", Content: "Message 1"},
+			{Role: "assistant", Content: "Response 1"},
+		}
+		require.False(t, shouldApplyLLMSummary(messages, config))
+	})
+
+	t.Run("returns false when not enough turns", func(t *testing.T) {
+		config := ContextManagerConfig{
+			SummarizeStrategy:    "llm_summary",
+			CompactionInterval:   5,
+			TokenEstimateRatio:   4.0,
+			LLMSummary: LLMSummaryConfig{
+				ServiceName: "llm-service",
+				Model:       "gpt-4",
+			},
+		}
+		messages := []Message{
+			{Role: "user", Content: "Message 1"},
+			{Role: "assistant", Content: "Response 1"},
+		}
+		require.False(t, shouldApplyLLMSummary(messages, config))
+	})
+}
+
+func TestGetMessagesToCompact(t *testing.T) {
+	t.Run("returns messages to compact", func(t *testing.T) {
+		config := ContextManagerConfig{
+			OverlapSize:   2,
+			PreserveLastN: 2,
+		}
+		messages := []Message{
+			{Role: "user", Content: "Message 1"},
+			{Role: "assistant", Content: "Response 1"},
+			{Role: "user", Content: "Message 2"},
+			{Role: "assistant", Content: "Response 2"},
+			{Role: "user", Content: "Message 3"},
+		}
+		toCompact := getMessagesToCompact(messages, config)
+		require.Len(t, toCompact, 3) // First 3 messages
+		require.Equal(t, "Message 1", toCompact[0].Content)
+	})
+
+	t.Run("returns nil when not enough messages", func(t *testing.T) {
+		config := ContextManagerConfig{
+			OverlapSize:   5,
+			PreserveLastN: 5,
+		}
+		messages := []Message{
+			{Role: "user", Content: "Hello"},
+		}
+		toCompact := getMessagesToCompact(messages, config)
+		require.Nil(t, toCompact)
+	})
+
+	t.Run("returns nil for empty messages", func(t *testing.T) {
+		config := ContextManagerConfig{
+			OverlapSize:   2,
+			PreserveLastN: 2,
+		}
+		toCompact := getMessagesToCompact([]Message{}, config)
+		require.Nil(t, toCompact)
+	})
+}
