@@ -136,6 +136,10 @@ type ContextManagerConfig struct {
 type LLMSummaryConfig struct {
 	// ServiceName is the DNS service name for the LLM API endpoint
 	ServiceName string `json:"service_name"`
+	// ServicePort is the port for the LLM API endpoint
+	ServicePort int64 `json:"service_port"`
+	// ServiceHost is the Host header for the LLM API endpoint
+	ServiceHost string `json:"service_host"`
 	// Model is the model name to use for summarization
 	Model string `json:"model"`
 	// APIKey is the API key for authentication
@@ -279,6 +283,7 @@ func parseConfig(json gjson.Result, config *ContextManagerConfig) error {
 	if llmSummaryJson.Exists() {
 		config.LLMSummary = LLMSummaryConfig{
 			ServiceName:           llmSummaryJson.Get("service_name").String(),
+			ServicePort:           llmSummaryJson.Get("service_port").Int(),
 			Model:                 llmSummaryJson.Get("model").String(),
 			APIKey:                llmSummaryJson.Get("api_key").String(),
 			SummaryPrefix:         llmSummaryJson.Get("summary_prefix").String(),
@@ -287,6 +292,7 @@ func parseConfig(json gjson.Result, config *ContextManagerConfig) error {
 			Timeout:               uint32(llmSummaryJson.Get("timeout").Uint()),
 			FallbackStrategy:      llmSummaryJson.Get("fallback_strategy").String(),
 		}
+
 		// Set defaults for llm_summary
 		if config.LLMSummary.SummaryPrefix == "" {
 			config.LLMSummary.SummaryPrefix = "[对话摘要] "
@@ -303,11 +309,21 @@ func parseConfig(json gjson.Result, config *ContextManagerConfig) error {
 		if config.LLMSummary.FallbackStrategy == "" {
 			config.LLMSummary.FallbackStrategy = "extractive"
 		}
+		// Set default port if not specified
+		if config.LLMSummary.ServicePort == 0 {
+			config.LLMSummary.ServicePort = 443
+		}
 		// Initialize HTTP client for LLM API calls
+		// Use FQDNCluster for Higress internal service discovery
 		if config.LLMSummary.ServiceName != "" {
-			config.LLMSummary.client = wrapper.NewClusterClient(wrapper.DnsCluster{
-				ServiceName: config.LLMSummary.ServiceName,
-				Port:        443,
+			host := config.LLMSummary.ServiceHost
+			if host == "" {
+				host = config.LLMSummary.ServiceName
+			}
+			config.LLMSummary.client = wrapper.NewClusterClient(wrapper.FQDNCluster{
+				FQDN: config.LLMSummary.ServiceName,
+				Port: config.LLMSummary.ServicePort,
+				Host: host,
 			})
 		}
 	}
@@ -465,8 +481,12 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config ContextManagerConfig, bod
 
 // handleLLMSummary handles the LLM-based summarization strategy with async HTTP call
 func handleLLMSummary(ctx wrapper.HttpContext, config ContextManagerConfig, originalBody []byte, msgList []Message, beforeMsgCount, beforeTokens int) types.Action {
+	proxywasm.LogInfo(fmt.Sprintf("[ContextManager] [LLM Summary] Step 1: Starting handleLLMSummary, beforeMsgCount=%d, beforeTokens=%d", beforeMsgCount, beforeTokens))
+	
 	// Get messages to compact
 	messagesToCompact := getMessagesToCompact(msgList, config)
+	proxywasm.LogInfo(fmt.Sprintf("[ContextManager] [LLM Summary] Step 2: getMessagesToCompact returned, len(messagesToCompact)=%d", len(messagesToCompact)))
+	
 	if len(messagesToCompact) == 0 {
 		log.Debugf("[ContextManager] No messages to compact")
 		return types.ActionContinue
@@ -474,13 +494,14 @@ func handleLLMSummary(ctx wrapper.HttpContext, config ContextManagerConfig, orig
 
 	// Log messages being compacted
 	compactTokens := estimateTotalTokens(messagesToCompact, config.TokenEstimateRatio)
-	log.Debugf("[ContextManager] LLM Summary: compacting %d messages (%d tokens), keeping %d recent",
-		len(messagesToCompact), compactTokens, len(msgList)-len(messagesToCompact))
+	proxywasm.LogInfo(fmt.Sprintf("[ContextManager] [LLM Summary] Step 3: Compacting %d messages (%d tokens), keeping %d recent",
+		len(messagesToCompact), compactTokens, len(msgList)-len(messagesToCompact)))
 
 	// Build LLM request
+	proxywasm.LogInfo("[ContextManager] [LLM Summary] Step 4: Building LLM summary request")
 	llmReqBody, err := buildLLMSummaryRequest(messagesToCompact, config.LLMSummary)
 	if err != nil {
-		log.Errorf("Failed to build LLM summary request: %v", err)
+		proxywasm.LogError(fmt.Sprintf("Failed to build LLM summary request: %v", err))
 		// Fallback to extractive summary
 		processedMessages := applyLLMSummaryStrategy(msgList, config, "")
 		afterTokens := estimateTotalTokens(processedMessages, config.TokenEstimateRatio)
@@ -488,6 +509,7 @@ func handleLLMSummary(ctx wrapper.HttpContext, config ContextManagerConfig, orig
 			beforeMsgCount, len(processedMessages), beforeTokens, afterTokens)
 		return finalizeRequest(ctx, originalBody, msgList, processedMessages)
 	}
+	proxywasm.LogInfo(fmt.Sprintf("[ContextManager] [LLM Summary] Step 5: LLM request built successfully, len(llmReqBody)=%d", len(llmReqBody)))
 
 	// Prepare headers
 	headers := [][2]string{
@@ -502,28 +524,31 @@ func handleLLMSummary(ctx wrapper.HttpContext, config ContextManagerConfig, orig
 	ctx.SetContext("before_tokens", beforeTokens)
 
 	// Make async HTTP call to LLM API
+	proxywasm.LogInfo(fmt.Sprintf("[ContextManager] [LLM Summary] Step 6: Making async HTTP call to LLM API, timeout=%dms", config.LLMSummary.Timeout))
 	config.LLMSummary.client.Post(
 		"/v1/chat/completions",
 		headers,
 		llmReqBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			proxywasm.LogInfo(fmt.Sprintf("[ContextManager] [LLM Summary] Step 7: Received HTTP callback, statusCode=%d, len(responseBody)=%d", statusCode, len(responseBody)))
 			defer proxywasm.ResumeHttpRequest()
 
 			var llmSummary string
 			var summaryMethod string
 			if statusCode == 200 && len(responseBody) > 0 {
+				proxywasm.LogInfo("[ContextManager] [LLM Summary] Step 8: Parsing LLM summary response")
 				summary, err := parseLLMSummaryResponse(responseBody)
 				if err != nil {
-					log.Warnf("[ContextManager] Failed to parse LLM summary response: %v, using fallback", err)
+					proxywasm.LogError(fmt.Sprintf("[ContextManager] Failed to parse LLM summary response: %v, using fallback", err))
 					summaryMethod = "fallback_extractive"
 				} else {
 					llmSummary = summary
 					summaryMethod = "llm_generated"
-					log.Debugf("[ContextManager] LLM summary generated: length=%d, preview=%s",
-						len(llmSummary), truncateString(llmSummary, 100))
+					proxywasm.LogInfo(fmt.Sprintf("[ContextManager] [LLM Summary] Step 9: LLM summary generated: length=%d, preview=%s",
+						len(llmSummary), truncateString(llmSummary, 100)))
 				}
 			} else {
-				log.Warnf("[ContextManager] LLM summary API returned status %d, using fallback", statusCode)
+				proxywasm.LogError(fmt.Sprintf("[ContextManager] LLM summary API returned status %d, using fallback", statusCode))
 				summaryMethod = "fallback_extractive"
 			}
 
@@ -534,6 +559,7 @@ func handleLLMSummary(ctx wrapper.HttpContext, config ContextManagerConfig, orig
 			beforeTokens, _ := ctx.GetContext("before_tokens").(int)
 
 			// Apply LLM summary strategy (with fallback if llmSummary is empty)
+			proxywasm.LogInfo("[ContextManager] [LLM Summary] Step 10: Applying LLM summary strategy")
 			processedMessages := applyLLMSummaryStrategy(msgList, config, llmSummary)
 
 			// Calculate and log results
@@ -546,9 +572,9 @@ func handleLLMSummary(ctx wrapper.HttpContext, config ContextManagerConfig, orig
 				tokenReductionPercent = float64(tokenReduction) / float64(beforeTokens) * 100
 			}
 
-			log.Infof("[ContextManager] LLM Summary complete: method=%s, messages=%d->%d (reduced %d), tokens=%d->%d (reduced %d, %.1f%%), summary_len=%d",
+			proxywasm.LogInfo(fmt.Sprintf("[ContextManager] [LLM Summary] Step 11: LLM Summary complete: method=%s, messages=%d->%d (reduced %d), tokens=%d->%d (reduced %d, %.1f%%), summary_len=%d",
 				summaryMethod, beforeMsgCount, afterMsgCount, msgReduction,
-				beforeTokens, afterTokens, tokenReduction, tokenReductionPercent, len(llmSummary))
+				beforeTokens, afterTokens, tokenReduction, tokenReductionPercent, len(llmSummary)))
 
 			// Store stats for observability (for ai-statistics integration)
 			ctx.SetContext("context_summary_method", summaryMethod)
@@ -573,21 +599,24 @@ func handleLLMSummary(ctx wrapper.HttpContext, config ContextManagerConfig, orig
 			ctx.SetUserAttribute("context_summary_length", itoa(len(llmSummary)))
 
 			// Rebuild and replace request body
+			proxywasm.LogInfo("[ContextManager] [LLM Summary] Step 12: Rebuilding request body")
 			if len(processedMessages) != len(msgList) || hasContentChanged(msgList, processedMessages) {
 				newBody, err := rebuildRequestBody(originalBody, processedMessages)
 				if err != nil {
-					log.Errorf("Failed to rebuild request body: %v", err)
+					proxywasm.LogError(fmt.Sprintf("Failed to rebuild request body: %v", err))
 					return
 				}
 
 				if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
-					log.Errorf("Failed to replace request body: %v", err)
+					proxywasm.LogError(fmt.Sprintf("Failed to replace request body: %v", err))
 				}
 			}
+			proxywasm.LogInfo("[ContextManager] [LLM Summary] Step 13: Request body replaced successfully")
 		},
 		config.LLMSummary.Timeout,
 	)
 
+	proxywasm.LogInfo("[ContextManager] [LLM Summary] Step 6.1: Async HTTP call initiated, returning ActionPause")
 	return types.ActionPause
 }
 
@@ -731,11 +760,28 @@ func applySlidingWindowStrategy(messages []Message, config ContextManagerConfig)
 }
 
 // estimateTokens provides a rough token count estimation
+// Chinese characters: ~1.5 chars per token
+// Other characters: ~4 chars per token
 func estimateTokens(text string, ratio float64) int {
-	if ratio <= 0 {
-		ratio = 4.0
+	chineseChars := 0
+	otherChars := 0
+
+	for _, r := range text {
+		if r >= 0x4e00 && r <= 0x9fff {
+			chineseChars++
+		} else {
+			otherChars++
+		}
 	}
-	return int(float64(len(text)) / ratio)
+
+	chineseTokens := float64(chineseChars) / 1.5
+	otherTokens := float64(otherChars) / ratio
+
+	if ratio <= 0 {
+		otherTokens = float64(otherChars) / 4.0
+	}
+
+	return int(chineseTokens + otherTokens)
 }
 
 // estimateTotalTokens estimates the total token count for a list of messages
@@ -749,9 +795,13 @@ func estimateTotalTokens(messages []Message, ratio float64) int {
 
 // shouldCompact determines whether compaction should be triggered based on configuration
 func shouldCompact(messages []Message, config ContextManagerConfig) bool {
+	log.Infof("[shouldCompact] Checking compaction conditions: len(messages)=%d, config.TokenThreshold=%d, config.MaxMessages=%d, config.MaxTokens=%d, config.CompactionInterval=%d, config.TokenEstimateRatio=%f",
+		len(messages), config.TokenThreshold, config.MaxMessages, config.MaxTokens, config.CompactionInterval, config.TokenEstimateRatio)
+
 	// Check compaction_interval: count conversation turns (user-assistant pairs)
 	if config.CompactionInterval > 0 {
 		turns := countConversationTurns(messages)
+		log.Infof("[shouldCompact] Checking compaction_interval: turns=%d, threshold=%d, satisfied=%v", turns, config.CompactionInterval, turns >= config.CompactionInterval)
 		if turns >= config.CompactionInterval {
 			return true
 		}
@@ -760,6 +810,7 @@ func shouldCompact(messages []Message, config ContextManagerConfig) bool {
 	// Check token_threshold
 	if config.TokenThreshold > 0 {
 		totalTokens := estimateTotalTokens(messages, config.TokenEstimateRatio)
+		log.Infof("[shouldCompact] Checking token_threshold: totalTokens=%d, threshold=%d, satisfied=%v", totalTokens, config.TokenThreshold, totalTokens >= config.TokenThreshold)
 		if totalTokens >= config.TokenThreshold {
 			return true
 		}
@@ -767,17 +818,20 @@ func shouldCompact(messages []Message, config ContextManagerConfig) bool {
 
 	// Check max_messages
 	if config.MaxMessages > 0 && len(messages) > config.MaxMessages {
+		log.Infof("[shouldCompact] Checking max_messages: len(messages)=%d, max=%d, satisfied=%v", len(messages), config.MaxMessages, true)
 		return true
 	}
 
 	// Check max_tokens
 	if config.MaxTokens > 0 {
 		totalTokens := estimateTotalTokens(messages, config.TokenEstimateRatio)
+		log.Infof("[shouldCompact] Checking max_tokens: totalTokens=%d, max=%d, satisfied=%v", totalTokens, config.MaxTokens, totalTokens > config.MaxTokens)
 		if totalTokens > config.MaxTokens {
 			return true
 		}
 	}
 
+	log.Infof("[shouldCompact] No compaction conditions satisfied, returning false")
 	return false
 }
 
@@ -1127,10 +1181,65 @@ func itoa(i int) string {
 	return string(reversed)
 }
 
-// buildConversationText converts messages to a conversation text format
-func buildConversationText(messages []Message) string {
-	var parts []string
+// isNoiseMessage detects if a message is noise that should be filtered out
+// Noise messages are filler content that doesn't contain useful information:
+// - Assistant confirmations: "I have noted...", "Yes, I still remember..."
+// - Topic discussions: "Let's discuss topic...", "Regarding topic..."
+// - Additional context filler: "Additional context N: This is supplementary..."
+// - Confirmation requests: "Can you confirm you remember..."
+func isNoiseMessage(msg Message) bool {
+	content := strings.ToLower(msg.Content)
+
+	noisePatterns := []string{
+		"i have noted the information",
+		"i've read and understood",
+		"it has been stored in my context",
+		"yes, i still remember",
+		"i have incorporated this information",
+		"it complements what we've discussed",
+		"it contains important details",
+		"the key points are relevant",
+		"it's an interesting subject",
+		"this is supplementary information",
+		"might be useful for our discussion",
+		"can you confirm you remember",
+		"please summarize what you know",
+		"let's discuss topic",
+		"regarding topic",
+		"thank you for providing additional context",
+		"thank you for providing supplementary",
+	}
+
+	for _, pattern := range noisePatterns {
+		if strings.Contains(content, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// filterNoiseMessages removes noise messages while preserving important content
+func filterNoiseMessages(messages []Message) []Message {
+	var filtered []Message
 	for _, msg := range messages {
+		if !isNoiseMessage(msg) {
+			filtered = append(filtered, msg)
+		}
+	}
+	return filtered
+}
+
+// buildConversationText converts messages to a conversation text format
+// Note: We do NOT truncate message content here because the LLM needs to see
+// the complete information to generate an accurate summary. Truncation would
+// cause information loss and result in poor quality summaries.
+// Noise messages are filtered out to reduce token usage and improve summary quality.
+func buildConversationText(messages []Message) string {
+	filtered := filterNoiseMessages(messages)
+
+	var parts []string
+	for _, msg := range filtered {
 		roleLabel := msg.Role
 		switch msg.Role {
 		case "user":
@@ -1140,11 +1249,7 @@ func buildConversationText(messages []Message) string {
 		case "system":
 			roleLabel = "系统"
 		}
-		content := msg.Content
-		if len(content) > 500 {
-			content = content[:500] + "..."
-		}
-		parts = append(parts, fmt.Sprintf("[%s]: %s", roleLabel, content))
+		parts = append(parts, fmt.Sprintf("[%s]: %s", roleLabel, msg.Content))
 	}
 	return strings.Join(parts, "\n\n")
 }
@@ -1167,11 +1272,28 @@ func buildLLMSummaryRequest(messages []Message, config LLMSummaryConfig) ([]byte
 
 // parseLLMSummaryResponse extracts the summary from LLM API response
 func parseLLMSummaryResponse(body []byte) (string, error) {
+	// First try standard OpenAI format (content field)
 	content := gjson.GetBytes(body, "choices.0.message.content").String()
-	if content == "" {
-		return "", fmt.Errorf("no content in LLM response")
+	if content != "" {
+		return content, nil
 	}
-	return content, nil
+	
+	// Try reasoning field (some models like Qwen use this for thinking process)
+	reasoning := gjson.GetBytes(body, "choices.0.message.reasoning").String()
+	if reasoning != "" {
+		// Extract the actual summary from reasoning if it contains thinking process
+		// Look for patterns like "Summary:" or similar markers
+		if idx := strings.Index(reasoning, "摘要："); idx != -1 {
+			return strings.TrimSpace(reasoning[idx+len("摘要："):]), nil
+		}
+		if idx := strings.Index(reasoning, "Summary:"); idx != -1 {
+			return strings.TrimSpace(reasoning[idx+len("Summary:"):]), nil
+		}
+		// If no marker found, return the whole reasoning
+		return reasoning, nil
+	}
+	
+	return "", fmt.Errorf("no content in LLM response")
 }
 
 // applyLLMSummaryStrategy applies LLM-based summarization strategy
@@ -1198,14 +1320,19 @@ func applyLLMSummaryStrategy(messages []Message, config ContextManagerConfig, ll
 	var summary Message
 	if llmSummary != "" {
 		summary = Message{
-			Role:    "system",
+			Role:    "user",
 			Content: config.LLMSummary.SummaryPrefix + llmSummary,
 		}
 	} else {
 		summary = compactMessages(messagesToCompact, config.CompactionSummaryTemplate)
 	}
 
-	result := make([]Message, 0, 1+len(messagesToKeep))
+	result := make([]Message, 0, 2+len(messagesToKeep))
+
+	if config.PreserveSystemMessage && len(messages) > 0 && messages[0].Role == "system" {
+		result = append(result, messages[0])
+	}
+
 	result = append(result, summary)
 	result = append(result, messagesToKeep...)
 
@@ -1229,17 +1356,24 @@ func getMessagesToCompact(messages []Message, config ContextManagerConfig) []Mes
 		return nil
 	}
 
+	startIdx := 0
+	if config.PreserveSystemMessage && len(messages) > 0 && messages[0].Role == "system" {
+		startIdx = 1
+	}
+
+	nonSystemMessages := messages[startIdx:]
+
 	keepRecent := config.OverlapSize
 	if config.PreserveLastN > keepRecent {
 		keepRecent = config.PreserveLastN
 	}
 
-	if len(messages) <= keepRecent {
+	if len(nonSystemMessages) <= keepRecent {
 		return nil
 	}
 
-	compactBoundary := len(messages) - keepRecent
-	return messages[:compactBoundary]
+	compactBoundary := len(nonSystemMessages) - keepRecent
+	return nonSystemMessages[:compactBoundary]
 }
 
 func truncateString(s string, maxLen int) string {
