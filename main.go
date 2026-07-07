@@ -15,6 +15,7 @@
 package main
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 
@@ -156,6 +157,14 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PromptGuardConfig, body [
 		// Check if content matches deny patterns
 		if matchesAnyPattern(content, config.compiledDenyPatterns) {
 			log.Infof("Malicious prompt detected, blocking request")
+			// 写入安全事件到 Dynamic Metadata，供 ai-agent-guard 收集并记录审计日志
+			appendSecurityEvent(SecurityEvent{
+				Type:     "prompt_injection",
+				Severity: "high",
+				Source:   "ai-prompt-guard",
+				Score:    80,
+				Detail:   "Detected prompt injection / jailbreak pattern in user message",
+			})
 			sendDenyResponse(config.DenyCode, config.DenyMessage)
 			return types.ActionContinue
 		}
@@ -193,6 +202,32 @@ func buildErrorResponse(message string) string {
 	// Escape special characters for JSON
 	escapedMessage := strings.ReplaceAll(message, "\"", "\\\"")
 	escapedMessage = strings.ReplaceAll(escapedMessage, "\n", "\\n")
-	
+
 	return `{"error":{"message":"` + escapedMessage + `","type":"prompt_guard_error","code":"content_blocked"}}`
+}
+
+// SecurityEvent 安全事件（与 ai-agent-guard 的 SecurityEvent 结构对齐）
+type SecurityEvent struct {
+	Type     string `json:"type"`
+	Severity string `json:"severity"`
+	Source   string `json:"source"`
+	Score    int    `json:"score"`
+	Detail   string `json:"detail"`
+}
+
+// appendSecurityEvent 向 Dynamic Metadata 追加安全事件，供 ai-agent-guard 收集并记录审计日志
+func appendSecurityEvent(event SecurityEvent) {
+	var events []SecurityEvent
+	if existing, err := proxywasm.GetProperty([]string{"security_events", "events"}); err == nil && len(existing) > 0 {
+		_ = json.Unmarshal(existing, &events)
+	}
+	events = append(events, event)
+	data, err := json.Marshal(events)
+	if err != nil {
+		log.Warnf("marshal security events failed: %v", err)
+		return
+	}
+	if err := proxywasm.SetProperty([]string{"security_events", "events"}, data); err != nil {
+		log.Warnf("set security_events metadata failed: %v", err)
+	}
 }
