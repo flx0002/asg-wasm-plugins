@@ -32,6 +32,8 @@ var (
 	protectionSpace = "MSE Gateway" // 认证失败时，返回响应头 WWW-Authenticate: Key realm=MSE Gateway
 )
 
+const mseConsumerHeader = "X-Mse-Consumer"
+
 func main() {}
 
 func init() {
@@ -134,7 +136,16 @@ type KeyAuthConfig struct {
 	// @Description en-US Consumers to be allowed for matched requests.
 	allow []string `yaml:"allow"`
 
+	// identify_only 仅识别模式：识别合法消费者并设置 x-mse-consumer 头，但不拒绝未认证请求。
+	// 用于影子AI监控模式，使 ai-statistics 能记录消费者身份。
+	identifyOnly bool `yaml:"identify_only"`
+
 	credential2Name map[string]string `yaml:"-"`
+}
+
+func clearConsumerHeader() {
+	_ = proxywasm.RemoveHttpRequestHeader(mseConsumerHeader)
+	_ = proxywasm.RemoveHttpRequestHeader("x-mse-consumer")
 }
 
 func parseGlobalConfig(json gjson.Result, global *KeyAuthConfig, log log.Log) error {
@@ -251,13 +262,30 @@ func parseOverrideRuleConfig(json gjson.Result, global KeyAuthConfig, config *Ke
 	if !allow.Exists() {
 		return errors.New("allow is required")
 	}
-	if len(allow.Array()) == 0 {
-		return errors.New("allow cannot be empty")
+
+	// Parse identify_only: when true, the plugin identifies valid consumers
+	// but does not reject unauthenticated requests. Used by shadow AI monitoring mode.
+	identifyOnly := json.Get("identify_only")
+	if identifyOnly.Exists() {
+		config.identifyOnly = identifyOnly.Bool()
+	}
+
+	// allow list can be empty in two cases:
+	// 1. identify_only is true (monitoring mode, no rejection)
+	// 2. legacy compatibility (route was previously disabled, empty allow means no restriction)
+	// In both cases, the plugin will not reject requests based on the allow list.
+	if len(allow.Array()) == 0 && !config.identifyOnly {
+		// Empty allow list without identify_only: treat as no restriction (pass through)
+		// This maintains backward compatibility with routes that have empty allow lists.
+		log.Info("empty allow list without identify_only, treating as no restriction")
+		ruleSet = true
+		return nil
 	}
 
 	for _, item := range allow.Array() {
 		config.allow = append(config.allow, item.String())
 	}
+
 	ruleSet = true
 
 	return nil
@@ -282,6 +310,8 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config KeyAuthConfig, log log
 		globalAuthSetTrue  = !globalAuthNoSet && *config.globalAuth
 		globalAuthSetFalse = !globalAuthNoSet && !*config.globalAuth
 	)
+	clearConsumerHeader()
+
 	// 不需要认证而直接放行的情况：
 	// - global_auth == false 且 当前 domain/route 未配置该插件
 	// - global_auth 未设置 且 有至少一个 domain/route 配置该插件 且 当前 domain/route 未配置该插件
@@ -318,8 +348,18 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config KeyAuthConfig, log log
 
 	// header/query
 	if len(tokens) > 1 {
+		// identify_only 模式：多 key 不拒绝，直接放行（不设置 x-mse-consumer）
+		if config.identifyOnly {
+			log.Info("identify_only mode: multiple key auth data found, pass through without consumer")
+			return types.ActionContinue
+		}
 		return deniedMultiKeyAuthData()
 	} else if len(tokens) <= 0 {
+		// identify_only 模式：无 key 不拒绝，直接放行（不设置 x-mse-consumer）
+		if config.identifyOnly {
+			log.Info("identify_only mode: no key auth data found, pass through without consumer")
+			return types.ActionContinue
+		}
 		return deniedNoKeyAuthData()
 	}
 
@@ -327,10 +367,15 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config KeyAuthConfig, log log
 	name, ok := config.credential2Name[tokens[0]]
 	if !ok {
 		log.Warnf("credential %q is not configured", tokens[0])
+		// identify_only 模式：未知 credential 不拒绝，直接放行（不设置 x-mse-consumer）
+		if config.identifyOnly {
+			log.Info("identify_only mode: unknown credential, pass through without consumer")
+			return types.ActionContinue
+		}
 		return deniedUnauthorizedConsumer()
 	}
 
-	proxywasm.AddHttpRequestHeader("X-Mse-Consumer", name)
+	proxywasm.AddHttpRequestHeader(mseConsumerHeader, name)
 
 	// 全局生效：
 	// - global_auth == true 且 当前 domain/route 未配置该插件
@@ -344,6 +389,11 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config KeyAuthConfig, log log
 	if globalAuthSetTrue && !noAllow {
 		if !contains(config.allow, name) {
 			log.Warnf("consumer %q is not allowed", name)
+			// identify_only 模式：不在 allow 列表也不拒绝，放行（已设置 x-mse-consumer）
+			if config.identifyOnly {
+				log.Infof("identify_only mode: consumer %q not in allow list, pass through anyway", name)
+				return types.ActionContinue
+			}
 			return deniedUnauthorizedConsumer()
 		}
 		log.Infof("consumer %q authenticated", name)
@@ -355,6 +405,11 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config KeyAuthConfig, log log
 		if !noAllow { // 配置了 allow 列表
 			if !contains(config.allow, name) {
 				log.Warnf("consumer %q is not allowed", name)
+				// identify_only 模式：不在 allow 列表也不拒绝，放行（已设置 x-mse-consumer）
+				if config.identifyOnly {
+					log.Infof("identify_only mode: consumer %q not in allow list, pass through anyway", name)
+					return types.ActionContinue
+				}
 				return deniedUnauthorizedConsumer()
 			}
 			log.Infof("consumer %q authenticated", name)

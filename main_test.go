@@ -23,6 +23,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func countRequestHeader(headers [][2]string, name string) int {
+	count := 0
+	for _, header := range headers {
+		if header[0] == name {
+			count++
+		}
+	}
+	return count
+}
+
+func hasRequestHeader(headers [][2]string, name string, value string) bool {
+	for _, header := range headers {
+		if header[0] == name && header[1] == value {
+			return true
+		}
+	}
+	return false
+}
+
 // 测试配置：基本 key-auth 配置
 var basicKeyAuthConfig = func() json.RawMessage {
 	data, _ := json.Marshal(map[string]interface{}{
@@ -291,8 +310,36 @@ var ruleConfig = func() json.RawMessage {
 	return data
 }()
 
-// 测试配置：规则配置 - 空的 allow 列表
-var invalidRuleConfig = func() json.RawMessage {
+// 测试配置：规则配置 - identify_only 模式（影子AI监控模式）
+var identifyOnlyConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"consumers": []map[string]interface{}{
+			{
+				"name":       "consumer1",
+				"credential": "token1",
+			},
+			{
+				"name":       "consumer2",
+				"credential": "token2",
+			},
+		},
+		"keys":        []string{"x-api-key"},
+		"in_header":   true,
+		"in_query":    false,
+		"global_auth": false,
+		"_rules_": []map[string]interface{}{
+			{
+				"_match_route_": []string{"test-route"},
+				"allow":         []string{"consumer1"},
+				"identify_only": true,
+			},
+		},
+	})
+	return data
+}()
+
+// 测试配置：规则配置 - 空的 allow 列表（现在允许，向后兼容）
+var emptyAllowRuleConfig = func() json.RawMessage {
 	data, _ := json.Marshal(map[string]interface{}{
 		"consumers": []map[string]interface{}{
 			{
@@ -492,11 +539,11 @@ func TestParseRuleConfig(t *testing.T) {
 			// allow 字段的解析可能需要更复杂的配置结构
 		})
 
-		// 测试无效的规则配置 - 空的 allow 列表
-		t.Run("invalid rule config - empty allow", func(t *testing.T) {
-			host, status := test.NewTestHost(invalidRuleConfig)
+		// 测试无效的规则配置 - 空的 allow 列表（现在允许，向后兼容）
+		t.Run("empty allow rule config - backward compatible", func(t *testing.T) {
+			host, status := test.NewTestHost(emptyAllowRuleConfig)
 			defer host.Reset()
-			require.Equal(t, types.OnPluginStartStatusFailed, status)
+			require.Equal(t, types.OnPluginStartStatusOK, status)
 		})
 	})
 }
@@ -515,6 +562,7 @@ func TestOnHTTPRequestHeaders(t *testing.T) {
 				{":path", "/test"},
 				{":method", "GET"},
 				{"x-api-key", "token1"},
+				{"x-mse-consumer", "spoofed-consumer"},
 			})
 
 			require.Equal(t, types.ActionContinue, action)
@@ -721,6 +769,156 @@ func TestOnHTTPRequestHeaders(t *testing.T) {
 			localResponse := host.GetLocalResponse()
 			require.NotNil(t, localResponse, "Missing API key in query should be rejected")
 			require.Equal(t, uint32(401), localResponse.StatusCode) // Unauthorized
+
+			host.CompleteHttp()
+		})
+
+		// 测试 identify_only 模式 - 合法消费者（在 allow 列表中）
+		t.Run("identify_only - valid consumer in allow list", func(t *testing.T) {
+			host, status := test.NewTestHost(identifyOnlyConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			// 设置路由名以匹配 _rules_ 中的 _match_route_
+			err := host.SetRouteName("test-route")
+			require.NoError(t, err)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/test"},
+				{":method", "GET"},
+				{"x-api-key", "token1"},
+			})
+
+			require.Equal(t, types.ActionContinue, action)
+			require.Equal(t, types.ActionContinue, host.GetHttpStreamAction())
+
+			localResponse := host.GetLocalResponse()
+			require.Nil(t, localResponse, "Valid consumer in allow list should pass through in identify_only mode")
+
+			// 验证设置了 x-mse-consumer 头
+			headers := host.GetRequestHeaders()
+			consumerHeaderFound := false
+			for _, header := range headers {
+				if header[0] == "x-mse-consumer" && header[1] == "consumer1" {
+					consumerHeaderFound = true
+					break
+				}
+			}
+			require.True(t, consumerHeaderFound, "X-Mse-Consumer header should be set for valid consumer")
+			require.Equal(t, 1, countRequestHeader(headers, "x-mse-consumer"))
+			require.False(t, hasRequestHeader(headers, "x-mse-consumer", "spoofed-consumer"))
+
+			host.CompleteHttp()
+		})
+
+		// 测试 identify_only 模式 - 合法消费者（不在 allow 列表中，仍放行）
+		t.Run("identify_only - valid consumer not in allow list", func(t *testing.T) {
+			host, status := test.NewTestHost(identifyOnlyConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			err := host.SetRouteName("test-route")
+			require.NoError(t, err)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/test"},
+				{":method", "GET"},
+				{"x-api-key", "token2"}, // consumer2 不在 allow 列表
+			})
+
+			require.Equal(t, types.ActionContinue, action)
+			require.Equal(t, types.ActionContinue, host.GetHttpStreamAction())
+
+			localResponse := host.GetLocalResponse()
+			require.Nil(t, localResponse, "Consumer not in allow list should still pass through in identify_only mode")
+
+			// 验证设置了 x-mse-consumer 头（消费者被识别）
+			headers := host.GetRequestHeaders()
+			consumerHeaderFound := false
+			for _, header := range headers {
+				if header[0] == "x-mse-consumer" && header[1] == "consumer2" {
+					consumerHeaderFound = true
+					break
+				}
+			}
+			require.True(t, consumerHeaderFound, "X-Mse-Consumer header should be set for valid consumer even not in allow list")
+
+			host.CompleteHttp()
+		})
+
+		// 测试 identify_only 模式 - 非法 API key（不拒绝，放行但不设置 consumer）
+		t.Run("identify_only - invalid api key", func(t *testing.T) {
+			host, status := test.NewTestHost(identifyOnlyConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			err := host.SetRouteName("test-route")
+			require.NoError(t, err)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/test"},
+				{":method", "GET"},
+				{"x-api-key", "invalid-token"},
+				{"x-mse-consumer", "spoofed-consumer"},
+			})
+
+			require.Equal(t, types.ActionContinue, action)
+			require.Equal(t, types.ActionContinue, host.GetHttpStreamAction())
+
+			localResponse := host.GetLocalResponse()
+			require.Nil(t, localResponse, "Invalid API key should pass through in identify_only mode (not rejected)")
+
+			// 验证未设置 x-mse-consumer 头
+			headers := host.GetRequestHeaders()
+			consumerHeaderFound := false
+			for _, header := range headers {
+				if header[0] == "x-mse-consumer" {
+					consumerHeaderFound = true
+					break
+				}
+			}
+			require.False(t, consumerHeaderFound, "X-Mse-Consumer header should NOT be set for invalid API key")
+			require.Equal(t, 0, countRequestHeader(headers, "x-mse-consumer"))
+
+			host.CompleteHttp()
+		})
+
+		// 测试 identify_only 模式 - 缺少 API key（不拒绝，放行但不设置 consumer）
+		t.Run("identify_only - missing api key", func(t *testing.T) {
+			host, status := test.NewTestHost(identifyOnlyConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			err := host.SetRouteName("test-route")
+			require.NoError(t, err)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/test"},
+				{":method", "GET"},
+				{"x-mse-consumer", "spoofed-consumer"},
+			})
+
+			require.Equal(t, types.ActionContinue, action)
+			require.Equal(t, types.ActionContinue, host.GetHttpStreamAction())
+
+			localResponse := host.GetLocalResponse()
+			require.Nil(t, localResponse, "Missing API key should pass through in identify_only mode (not rejected)")
+
+			// 验证未设置 x-mse-consumer 头
+			headers := host.GetRequestHeaders()
+			consumerHeaderFound := false
+			for _, header := range headers {
+				if header[0] == "x-mse-consumer" {
+					consumerHeaderFound = true
+					break
+				}
+			}
+			require.False(t, consumerHeaderFound, "X-Mse-Consumer header should NOT be set for missing API key")
+			require.Equal(t, 0, countRequestHeader(headers, "x-mse-consumer"))
 
 			host.CompleteHttp()
 		})
