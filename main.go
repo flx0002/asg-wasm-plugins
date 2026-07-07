@@ -15,6 +15,7 @@
 package main
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 
@@ -66,6 +67,9 @@ type PIIGuardConfig struct {
 	// LogMatches indicates whether to log PII matches (without actual values)
 	LogMatches bool `json:"log_matches"`
 }
+
+// piiContextKey for storing PII detection state across phases
+const piiCtxKey = "pii_guard_matched_rules"
 
 // DefaultPIIRules returns common PII patterns
 func DefaultPIIRules() []PIIRule {
@@ -188,6 +192,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PIIGuardConfig, body []by
 	// Process each message
 	newBody := string(body)
 	messagesArray := messages.Array()
+	var matchedRules []string
 	for i, msg := range messagesArray {
 		content := msg.Get("content").String()
 		if content == "" {
@@ -195,7 +200,10 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PIIGuardConfig, body []by
 		}
 
 		// Mask PII in content
-		maskedContent := maskPII(content, config.Rules, config.LogMatches)
+		maskedContent, matched := maskPII(content, config.Rules, config.LogMatches)
+		if len(matched) > 0 {
+			matchedRules = append(matchedRules, matched...)
+		}
 		if maskedContent != content {
 			path := "messages." + itoa(i) + ".content"
 			var err error
@@ -204,6 +212,20 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PIIGuardConfig, body []by
 				log.Errorf("Failed to update message content: %v", err)
 			}
 		}
+	}
+
+	// 检测到 PII 时写入安全事件到 Dynamic Metadata，供 ai-agent-guard 收集并记录审计日志
+	if len(matchedRules) > 0 {
+		// 方案 A：Dynamic Metadata（同 VM 内共享）
+		appendSecurityEvent(SecurityEvent{
+			Type:     "pii_leak",
+			Severity: "medium",
+			Source:   "ai-pii-guard",
+			Score:    60,
+			Detail:   "PII detected and masked in request: " + strings.Join(matchedRules, ","),
+		})
+		// 方案 B：上下文存储，供响应头阶段设置 x-pii-detected 头（跨 VM 保底方案）
+		ctx.SetContext(piiCtxKey, matchedRules)
 	}
 
 	if newBody != string(body) {
@@ -216,6 +238,10 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PIIGuardConfig, body []by
 }
 
 func onHttpResponseHeaders(ctx wrapper.HttpContext, config PIIGuardConfig) types.Action {
+	// 从上下文读取请求阶段检测到的 PII 规则名，设置响应头供 ai-agent-guard 检测
+	if matchedRules, ok := ctx.GetContext(piiCtxKey).([]string); ok && len(matchedRules) > 0 {
+		_ = proxywasm.AddHttpResponseHeader("x-pii-detected", strings.Join(matchedRules, ","))
+	}
 	if !config.ProtectResponse {
 		ctx.DontReadResponseBody()
 	}
@@ -241,7 +267,7 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PIIGuardConfig, body []b
 		}
 
 		// Mask PII in content
-		maskedContent := maskPII(content, config.Rules, config.LogMatches)
+		maskedContent, _ := maskPII(content, config.Rules, config.LogMatches)
 		if maskedContent != content {
 			path := "choices." + itoa(i) + ".message.content"
 			var err error
@@ -262,8 +288,10 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PIIGuardConfig, body []b
 }
 
 // maskPII masks PII in the given text using the configured rules
-func maskPII(text string, rules []PIIRule, logMatches bool) string {
+// 返回脱敏后的文本和命中的规则名列表
+func maskPII(text string, rules []PIIRule, logMatches bool) (string, []string) {
 	result := text
+	var matched []string
 	for _, rule := range rules {
 		if rule.compiled == nil {
 			continue
@@ -272,15 +300,43 @@ func maskPII(text string, rules []PIIRule, logMatches bool) string {
 			if logMatches {
 				log.Infof("PII detected: rule=%s", rule.Name)
 			}
+			matched = append(matched, rule.Name)
 			result = rule.compiled.ReplaceAllString(result, rule.Replacement)
 		}
 	}
-	return result
+	return result, matched
 }
 
 // MaskPIIInMessages masks PII in messages (exported for testing)
 func MaskPIIInMessages(messages string, rules []PIIRule) string {
-	return maskPII(messages, rules, false)
+	masked, _ := maskPII(messages, rules, false)
+	return masked
+}
+
+// SecurityEvent 安全事件（与 ai-agent-guard 的 SecurityEvent 结构对齐）
+type SecurityEvent struct {
+	Type     string `json:"type"`
+	Severity string `json:"severity"`
+	Source   string `json:"source"`
+	Score    int    `json:"score"`
+	Detail   string `json:"detail"`
+}
+
+// appendSecurityEvent 向 Dynamic Metadata 追加安全事件，供 ai-agent-guard 收集并记录审计日志
+func appendSecurityEvent(event SecurityEvent) {
+	var events []SecurityEvent
+	if existing, err := proxywasm.GetProperty([]string{"security_events", "events"}); err == nil && len(existing) > 0 {
+		_ = json.Unmarshal(existing, &events)
+	}
+	events = append(events, event)
+	data, err := json.Marshal(events)
+	if err != nil {
+		log.Warnf("marshal security events failed: %v", err)
+		return
+	}
+	if err := proxywasm.SetProperty([]string{"security_events", "events"}, data); err != nil {
+		log.Warnf("set security_events metadata failed: %v", err)
+	}
 }
 
 // itoa converts int to string without importing strconv
