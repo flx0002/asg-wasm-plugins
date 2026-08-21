@@ -46,6 +46,13 @@ docker run --rm -v $(pwd):/workspace -w /workspace/extensions/ai-pii-guard \
 - WasmPlugin CR 配置放 `matchRules[].config`（`defaultConfig` 在存在 `_rules_` 时不参与合并）。
 - 镜像 tag 语义化（如 1.0.15），与 WasmPlugin CR 引用保持一致。
 
+## Registry 说明
+
+- **推送**：用 `127.0.0.1:5000`（docker 对 localhost 信任 HTTP，无需 insecure 配置）。
+- **集群引用**：本地 registry 监听 `0.0.0.0:5000`，`127.0.0.1:5000` 与集群可达地址
+  `172.22.0.3:5000` 是同一存储，tag 互通。WasmPlugin CR 引用集群可达地址即可。
+- **生产**：`REGISTRY=registry.example.com/plugins/ make build-push PLUGIN_NAME=<x>`。
+
 ## 网络代理说明
 
 - 构建默认使用 goproxy.cn（国内可达）；如构建机已配置 go 环境则使用其 GOPROXY。
