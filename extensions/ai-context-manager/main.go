@@ -1320,7 +1320,7 @@ func applyLLMSummaryStrategy(messages []Message, config ContextManagerConfig, ll
 	var summary Message
 	if llmSummary != "" {
 		summary = Message{
-			Role:    "user",
+			Role:    "system",
 			Content: config.LLMSummary.SummaryPrefix + llmSummary,
 		}
 	} else {
