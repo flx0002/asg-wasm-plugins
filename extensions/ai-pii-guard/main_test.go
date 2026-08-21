@@ -138,48 +138,48 @@ func TestMaskPII(t *testing.T) {
 
 	t.Run("masks email", func(t *testing.T) {
 		input := "Contact me at john.doe@example.com for more info"
-		result := maskPII(input, rules, false)
+		result, _ := maskPII(input, rules, false)
 		require.Equal(t, "Contact me at [EMAIL] for more info", result)
 	})
 
 	t.Run("masks phone number", func(t *testing.T) {
 		input := "My phone is 13812345678"
-		result := maskPII(input, rules, false)
+		result, _ := maskPII(input, rules, false)
 		require.Equal(t, "My phone is [PHONE]", result)
 	})
 
 	t.Run("masks ID card", func(t *testing.T) {
 		input := "ID: 110101199003076519"
-		result := maskPII(input, rules, false)
+		result, _ := maskPII(input, rules, false)
 		require.Equal(t, "ID: [ID]", result)
 	})
 
 	t.Run("masks multiple PII types separately", func(t *testing.T) {
 		// Test each type separately to avoid overlap issues
 		emailInput := "Email: test@test.com"
-		emailResult := maskPII(emailInput, rules, false)
+		emailResult, _ := maskPII(emailInput, rules, false)
 		require.Equal(t, "Email: [EMAIL]", emailResult)
 
 		phoneInput := "Phone: 13912345678"
-		phoneResult := maskPII(phoneInput, rules, false)
+		phoneResult, _ := maskPII(phoneInput, rules, false)
 		require.Equal(t, "Phone: [PHONE]", phoneResult)
 	})
 
 	t.Run("no PII to mask", func(t *testing.T) {
 		input := "Hello, how are you today?"
-		result := maskPII(input, rules, false)
+		result, _ := maskPII(input, rules, false)
 		require.Equal(t, "Hello, how are you today?", result)
 	})
 
 	t.Run("empty text", func(t *testing.T) {
 		input := ""
-		result := maskPII(input, rules, false)
+		result, _ := maskPII(input, rules, false)
 		require.Equal(t, "", result)
 	})
 
 	t.Run("empty rules", func(t *testing.T) {
 		input := "test@test.com"
-		result := maskPII(input, []PIIRule{}, false)
+		result, _ := maskPII(input, []PIIRule{}, false)
 		require.Equal(t, "test@test.com", result)
 	})
 }

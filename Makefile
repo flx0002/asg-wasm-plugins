@@ -11,7 +11,7 @@ BUILD_TIME := $(shell date "+%Y%m%d-%H%M%S")
 COMMIT_ID := $(shell git rev-parse --short HEAD 2>/dev/null)
 IMAGE_TAG = $(if $(strip $(PLUGIN_VERSION)),${PLUGIN_VERSION},${BUILD_TIME}-${COMMIT_ID})
 IMG ?= ${REGISTRY}${PLUGIN_NAME}:${IMAGE_TAG}
-GOPROXY := $(shell go env GOPROXY 2>/dev/null || echo "https://proxy.golang.org,direct")
+GOPROXY := $(shell go env GOPROXY 2>/dev/null || echo "https://goproxy.cn,direct")
 
 .DEFAULT:
 build:

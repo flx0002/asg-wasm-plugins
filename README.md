@@ -45,3 +45,8 @@ docker run --rm -v $(pwd):/workspace -w /workspace/extensions/ai-pii-guard \
 - 本仓库为自研插件唯一开发位置；AISecGw 内禁止新增插件代码。
 - WasmPlugin CR 配置放 `matchRules[].config`（`defaultConfig` 在存在 `_rules_` 时不参与合并）。
 - 镜像 tag 语义化（如 1.0.15），与 WasmPlugin CR 引用保持一致。
+
+## 网络代理说明
+
+- 构建默认使用 goproxy.cn（国内可达）；如构建机已配置 go 环境则使用其 GOPROXY。
+- 强制指定：`make build PLUGIN_NAME=<x> GOPROXY=https://goproxy.cn,direct`
