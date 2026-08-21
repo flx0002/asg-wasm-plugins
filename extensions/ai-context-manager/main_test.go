@@ -1322,14 +1322,15 @@ func TestBuildConversationText(t *testing.T) {
 		require.Contains(t, text, "[用户]: How are you?")
 	})
 
-	t.Run("truncates long messages", func(t *testing.T) {
+	t.Run("keeps long messages intact for summarization", func(t *testing.T) {
+		// buildConversationText intentionally does NOT truncate: the LLM
+		// needs complete info for an accurate summary (see main.go note).
 		longContent := strings.Repeat("a", 600)
 		messages := []Message{
 			{Role: "user", Content: longContent},
 		}
 		text := buildConversationText(messages)
-		require.Contains(t, text, "...")
-		require.LessOrEqual(t, len(text), 600)
+		require.Contains(t, text, longContent)
 	})
 }
 
