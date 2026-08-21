@@ -1,0 +1,8 @@
+# 构建产物
+*.wasm
+*.deb
+*.tgz
+*.tar.gz
+main.wasm
+plugin.wasm
+build/

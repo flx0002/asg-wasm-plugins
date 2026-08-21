@@ -1,0 +1,8 @@
+.git
+.gitignore
+.dockerignore
+extensions/*/plugin.wasm
+extensions/*/main.wasm
+extensions/*/*.deb
+extensions/*/*.tgz
+extensions/*/*.tar.gz
