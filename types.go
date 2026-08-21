@@ -34,6 +34,9 @@ type RequestState struct {
 	// 模型名
 	Model string
 
+	// 脱敏后的请求正文（用于审计取证）
+	RequestBodyContent string
+
 	// 标记
 	ResponseCaptured bool
 	AuditWritten     bool // 审计日志是否已写入，防止多路径重复写入

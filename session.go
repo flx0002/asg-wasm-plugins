@@ -278,6 +278,9 @@ func recordRequestMetadata(rs *RequestState, body []byte) {
 	if model := gjson.GetBytes(body, "model"); model.Exists() {
 		rs.Model = model.String()
 	}
+
+	// 记录脱敏后的请求正文（审计取证用，不落原始敏感内容）
+	rs.RequestBodyContent = truncateAndSanitize(string(body), MaxRequestBodyContentLength)
 }
 
 // captureTokenUsage 从 SSE 流式响应中捕获 Token 用量
@@ -312,6 +315,29 @@ func captureTokenUsage(rs *RequestState, chunk []byte) {
 	}
 
 	rs.ResponseCaptured = true
+}
+
+// incrementSessionTokens 响应结束后把真实 token 用量增量累加到 Session 配额
+func incrementSessionTokens(cfg *config.AgentGuardConfig, rs *RequestState) {
+	if rs == nil || rs.SessionMeta == nil || rs.InputToken+rs.OutputToken <= 0 {
+		return
+	}
+	if !cfg.RedisClient.Ready() {
+		return
+	}
+	key := fmt.Sprintf(RedisKeySessionMeta, rs.SessionID)
+	args := []interface{}{
+		time.Now().Unix(),
+		rs.InputToken + rs.OutputToken,
+		cfg.SessionLimits.SessionTimeout,
+	}
+	cfg.RedisClient.Eval(luaIncrementSessionToken, 1, []interface{}{key}, args, func(response resp.Value) {
+		if response.IsNull() {
+			log.Warnf("increment session token returned null (session=%s)", rs.SessionID)
+			return
+		}
+		log.Debugf("session token incremented: session=%s token_count=%s", rs.SessionID, response.String())
+	})
 }
 
 // determineAction 根据风险评分确定触发动作

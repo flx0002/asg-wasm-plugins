@@ -20,6 +20,8 @@ const (
 	MaxFieldLength  = 512 // 单字段截断长度
 	MaxDetailLength = 256 // 事件详情截断长度
 	MaxEventsPerLog = 20  // 单条日志最大事件数
+	// MaxRequestBodyContentLength 请求正文记录最大长度（脱敏后截断）
+	MaxRequestBodyContentLength = 2048
 )
 
 // AuditLogEntry 审计日志条目（写入 ai_log 和 Redis）
@@ -45,6 +47,7 @@ type AuditLogEntry struct {
 	RequestBodySize  int64        `json:"request_body_size"`
 	ResponseStatus   int          `json:"response_status"`
 	ResponseBodySize int64        `json:"response_body_size"`
+	RequestBodyContent string `json:"request_body_content,omitempty"`
 	Blocked          bool         `json:"blocked"`
 	RecordTypes      []string     `json:"record_types"`
 	HighRisk         bool         `json:"high_risk"`
@@ -297,6 +300,7 @@ func buildAuditEntry(cfg *config.AgentGuardConfig, rs *RequestState) AuditLogEnt
 		InputToken:       rs.InputToken,
 		OutputToken:      rs.OutputToken,
 		RequestBodySize:  rs.RequestBodySize,
+		RequestBodyContent: rs.RequestBodyContent,
 		ResponseBodySize: rs.ResponseBodySize,
 		ResponseStatus:   rs.ResponseStatus,
 		Blocked:          rs.Blocked,

@@ -68,6 +68,26 @@ redis.call('EXPIRE', key, session_timeout)
 return tostring(math.floor(new_risk))
 `
 
+// luaIncrementSessionToken 仅累加 Session token 用量（不改变 request_count/step_count/risk）
+//
+// KEYS[1] = Session meta Hash key
+// ARGV[1] = 当前时间戳（秒）
+// ARGV[2] = Token 增量
+// ARGV[3] = Session 超时时间（秒）
+//
+// 返回值：更新后的 token_count
+const luaIncrementSessionToken = `
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local token_delta = tonumber(ARGV[2])
+local session_timeout = tonumber(ARGV[3])
+local token_count = tonumber(redis.call('HGET', key, 'token_count') or '0')
+local new_count = token_count + token_delta
+redis.call('HSET', key, 'token_count', tostring(new_count), 'last_active_time', tostring(now))
+redis.call('EXPIRE', key, session_timeout)
+return tostring(new_count)
+`
+
 // luaCheckRateLimit 滑动窗口限流检查
 //
 // KEYS[1] = 请求计数窗口 key

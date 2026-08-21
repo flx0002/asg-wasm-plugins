@@ -24,6 +24,7 @@ import (
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/higress-group/wasm-go/pkg/log"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/resp"
 )
 
@@ -379,6 +380,8 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, cfg config.AgentGuardC
 	// 捕获 token 用量（从流式响应的最后一个 chunk）
 	if endOfStream {
 		captureTokenUsage(rs, chunk)
+		// 累加到 Session token 配额
+		incrementSessionTokens(&cfg, rs)
 
 		// 兜底收集安全事件（确保 onHttpResponseHeaders 未触发时也能收集）
 		if len(rs.Events) == 0 {
@@ -408,9 +411,30 @@ func onHttpResponseBody(ctx wrapper.HttpContext, cfg config.AgentGuardConfig, bo
 	}
 	// 根据响应状态码推断安全事件（Wasm 插件 Dynamic Metadata 不跨 VM 共享的兜底方案）
 	inferSecurityEventsFromResponse(rs)
+	// 非流式响应：从 JSON body 解析 token 用量并累加到 Session 配额
+	captureTokenUsageFromBody(rs, body)
+	incrementSessionTokens(&cfg, rs)
 	// 非流式响应（如安全插件拦截的本地响应）：直接写入审计日志
 	writeAuditLog(ctx, &cfg, rs)
 	return types.ActionContinue
+}
+
+// captureTokenUsageFromBody 非流式响应中解析 token 用量（OpenAI chat completions usage 字段）
+func captureTokenUsageFromBody(rs *RequestState, body []byte) {
+	if len(body) == 0 || rs.ResponseCaptured {
+		return
+	}
+	usage := gjson.GetBytes(body, "usage")
+	if usage.Exists() {
+		in := usage.Get("prompt_tokens").Int()
+		out := usage.Get("completion_tokens").Int()
+		if in > 0 || out > 0 {
+			rs.InputToken = in
+			rs.OutputToken = out
+			rs.ResponseCaptured = true
+			log.Debugf("captured token usage from non-streaming body: input=%d output=%d", rs.InputToken, rs.OutputToken)
+		}
+	}
 }
 
 // inferSecurityEventsFromResponse 根据响应状态码和响应头推断安全事件
