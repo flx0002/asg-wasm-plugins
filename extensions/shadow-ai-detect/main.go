@@ -19,26 +19,52 @@ func init() {
 		"shadow-ai-detect",
 		wrapper.ParseConfigBy(parseConfig),
 		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
+		wrapper.ProcessRequestBody(onHttpRequestBody),
 	)
 }
 
+// 命中特征类型（IR-001：域名外至少 1 种特征）
+const (
+	featureDomain      = "domain"      // SNI/Host 域名匹配（原有）
+	featurePath        = "path"        // LLM API 特征路径匹配
+	featureJsonBody    = "json_body"   // JSON 载荷结构特征（model/messages/prompt 等字段）
+	featureDomainSSE   = "domain_sse"  // 域名命中 + SSE 流式请求（Accept: text/event-stream）
+	featurePathSSE     = "path_sse"    // 路径命中 + SSE 流式请求
+	acceptSSE          = "text/event-stream"
+)
+
 // CategoryConfig defines a category of AI services to detect
 type CategoryConfig struct {
-	Name      string   // e.g. "saas_ai"
-	Label     string   // e.g. "云端SaaS AI"
-	RiskLevel string   // e.g. "high"
-	Domains   []string // exact domain matches, e.g. "api.openai.com"
-	Suffixes  []string // domain suffix matches, e.g. ".openai.com"
+	Name         string   // e.g. "saas_ai"
+	Label        string   // e.g. "云端SaaS AI"
+	RiskLevel    string   // e.g. "high"
+	Domains      []string // exact domain matches, e.g. "api.openai.com"
+	Suffixes     []string // domain suffix matches, e.g. ".openai.com"
+	PathPatterns []string // LLM API path prefixes, e.g. "/v1/chat/completions"
+	BodyFeatures []string // JSON body feature fields, e.g. "model", "messages"
 }
 
 // ShadowAiDetectConfig is the plugin configuration
 type ShadowAiDetectConfig struct {
-	mode           string            // "monitoring" or "enforcement"
-	blockedCode    uint32            // HTTP status code for blocking
-	blockedMessage string            // response body for blocking
-	categories     []CategoryConfig  // AI service categories to detect
-	counterMetrics map[string]proxywasm.MetricCounter
+	mode              string            // "monitoring" or "enforcement"
+	blockedCode       uint32            // HTTP status code for blocking
+	blockedMessage    string            // response body for blocking
+	enablePathFeature bool              // enable API path feature detection
+	enableBodyFeature bool              // enable JSON body feature detection
+	enableSseFeature  bool              // enable SSE streaming enhancement
+	categories        []CategoryConfig  // AI service categories to detect
+	counterMetrics    map[string]proxywasm.MetricCounter
 }
+
+// hitResult records a detection hit with its feature type
+type hitResult struct {
+	category CategoryConfig
+	feature  string // one of featureDomain/featurePath/featureJsonBody/featureDomainSSE/featurePathSSE
+	domain   string // matched domain (may be empty for path/body hits)
+	detail   string // matched value for logging (path or body field)
+}
+
+const ctxHitKey = "shadow-ai-hit"
 
 func parseConfig(json gjson.Result, config *ShadowAiDetectConfig, log log.Log) error {
 	// Parse mode
@@ -60,6 +86,11 @@ func parseConfig(json gjson.Result, config *ShadowAiDetectConfig, log log.Log) e
 	if config.blockedMessage == "" {
 		config.blockedMessage = "Access to unauthorized AI service is blocked"
 	}
+
+	// Parse feature switches (all enabled by default)
+	config.enablePathFeature = !json.Get("enable_path_feature").Exists() || json.Get("enable_path_feature").Bool()
+	config.enableBodyFeature = !json.Get("enable_body_feature").Exists() || json.Get("enable_body_feature").Bool()
+	config.enableSseFeature = !json.Get("enable_sse_feature").Exists() || json.Get("enable_sse_feature").Bool()
 
 	// Parse categories
 	categoriesResult := json.Get("categories")
@@ -93,7 +124,23 @@ func parseConfig(json gjson.Result, config *ShadowAiDetectConfig, log log.Log) e
 			}
 		}
 
-		if len(cc.Domains) > 0 || len(cc.Suffixes) > 0 {
+		// Path patterns: normalized to lowercase, keep as-is (prefix match on request path)
+		for _, p := range cat.Get("path_patterns").Array() {
+			pattern := strings.ToLower(strings.TrimSpace(p.String()))
+			if pattern != "" {
+				cc.PathPatterns = append(cc.PathPatterns, pattern)
+			}
+		}
+
+		// Body features: JSON field names to look up in the request body
+		for _, f := range cat.Get("body_features").Array() {
+			field := strings.TrimSpace(f.String())
+			if field != "" {
+				cc.BodyFeatures = append(cc.BodyFeatures, field)
+			}
+		}
+
+		if len(cc.Domains) > 0 || len(cc.Suffixes) > 0 || len(cc.PathPatterns) > 0 || len(cc.BodyFeatures) > 0 {
 			config.categories = append(config.categories, cc)
 		}
 	}
@@ -119,56 +166,151 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config ShadowAiDetectConfig, 
 		host = strings.ToLower(stripPortFromHost(h))
 	}
 
-	if sni == "" && host == "" {
+	// Get request path (:path pseudo header)
+	path := ""
+	if p, err := proxywasm.GetHttpRequestHeader(":path"); err == nil {
+		path = strings.ToLower(p)
+		if i := strings.Index(path, "?"); i != -1 {
+			path = path[:i]
+		}
+	}
+
+	// Get Accept header for SSE streaming enhancement
+	accept := ""
+	if a, err := proxywasm.GetHttpRequestHeader("accept"); err == nil {
+		accept = strings.ToLower(a)
+	}
+	wantsSSE := config.enableSseFeature && strings.Contains(accept, acceptSSE)
+
+	if sni == "" && host == "" && path == "" {
 		return types.ActionContinue
 	}
 
-	// Match against categories
+	// Stage 1: domain match (existing behavior)
 	for _, cat := range config.categories {
 		matched, matchedDomain := matchDomainWithResult(sni, host, cat)
 		if matched {
-			// Use the matched domain for metric (prefer host over sni)
-			domain := matchedDomain
-			if domain == "" {
-				domain = host
-				if domain == "" {
-					domain = sni
+			feature := featureDomain
+			if wantsSSE {
+				feature = featureDomainSSE
+			}
+			return reportAndBlock(ctx, config, cat, feature, matchedDomain, matchedDomain)
+		}
+	}
+
+	// Stage 2: API path feature (IR-001 non-domain feature)
+	if config.enablePathFeature && path != "" {
+		for _, cat := range config.categories {
+			if matchedPattern := matchPathPattern(path, cat); matchedPattern != "" {
+				feature := featurePath
+				if wantsSSE {
+					feature = featurePathSSE
 				}
+				return reportAndBlock(ctx, config, cat, feature, matchedPattern, path)
 			}
+		}
+	}
 
-			// Determine status based on mode: "blocked" in enforcement, "allowed" in monitoring
-			status := "allowed"
-			if config.mode == "enforcement" {
-				status = "blocked"
+	// Stage 3: JSON body feature is checked in onHttpRequestBody (needs body)
+	// Mark whether body detection is needed via context for the body callback.
+	if config.enableBodyFeature {
+		for _, cat := range config.categories {
+			if len(cat.BodyFeatures) > 0 {
+				ctx.SetContext(ctxHitKey, "pending")
+				return types.ActionContinue
 			}
-
-			// Emit Prometheus metric using "." separator format (same as ai-statistics)
-			// so Envoy's Prometheus exporter can convert it to labeled format.
-			// Format: shadow_ai_detect.category.{cat}.domain.{domain}.risk.{risk}.status.{status}.requests
-			metricName := fmt.Sprintf("shadow_ai_detect.category.%s.domain.%s.risk.%s.status.%s.requests",
-				sanitizeMetricValue(cat.Name),
-				sanitizeMetricValue(domain),
-				sanitizeMetricValue(cat.RiskLevel),
-				status,
-			)
-			config.incrementCounter(metricName, 1)
-
-			log.Infof("shadow-ai-detect: matched category=%s domain=%s risk=%s status=%s host=%s sni=%s",
-				cat.Name, domain, cat.RiskLevel, status, host, sni)
-
-			// Block in enforcement mode
-			if config.mode == "enforcement" {
-				proxywasm.SendHttpResponseWithDetail(config.blockedCode,
-					"shadow-ai-detect.blocked", nil, []byte(config.blockedMessage), -1)
-				return types.ActionPause
-			}
-
-			// In monitoring mode, just continue
-			return types.ActionContinue
 		}
 	}
 
 	return types.ActionContinue
+}
+
+func onHttpRequestBody(ctx wrapper.HttpContext, config ShadowAiDetectConfig, body []byte) types.Action {
+	// Only run when headers stage did not hit (checked via context marker)
+	marker := ctx.GetContext(ctxHitKey)
+	if marker != "pending" {
+		return types.ActionContinue
+	}
+	if len(body) == 0 || !config.enableBodyFeature {
+		return types.ActionContinue
+	}
+
+	// JSON body feature: look up configured fields (gjson path semantics)
+	for _, cat := range config.categories {
+		if len(cat.BodyFeatures) == 0 {
+			continue
+		}
+		for _, field := range cat.BodyFeatures {
+			// gjson field lookup: top-level or nested (e.g. "model", "messages", "input.prompt")
+			if gjson.GetBytes(body, field).Exists() {
+				return reportAndBlock(ctx, config, cat, featureJsonBody, field, string(body))
+			}
+		}
+	}
+
+	return types.ActionContinue
+}
+
+// reportAndBlock emits the detection metric + log and blocks in enforcement mode.
+// Monitoring mode always continues; the ctx hit marker prevents duplicate body detection.
+func reportAndBlock(ctx wrapper.HttpContext, config ShadowAiDetectConfig, cat CategoryConfig,
+	feature, domain, detail string) types.Action {
+
+	// Mark hit so the body callback skips duplicate detection
+	ctx.SetContext(ctxHitKey, "hit")
+
+	// Determine status based on mode: "blocked" in enforcement, "allowed" in monitoring
+	status := "allowed"
+	if config.mode == "enforcement" {
+		status = "blocked"
+	}
+
+	// Emit Prometheus metric using "." separator format (same as ai-statistics)
+	// so Envoy's Prometheus exporter can convert it to labeled format.
+	// Domain hits keep the legacy format; feature hits use the feature-dimension format.
+	var metricName string
+	switch feature {
+	case featureDomain, featureDomainSSE:
+		metricName = fmt.Sprintf("shadow_ai_detect.category.%s.domain.%s.risk.%s.status.%s.requests",
+			sanitizeMetricValue(cat.Name),
+			sanitizeMetricValue(domain),
+			sanitizeMetricValue(cat.RiskLevel),
+			status,
+		)
+	default:
+		metricName = fmt.Sprintf("shadow_ai_detect.category.%s.feature.%s.risk.%s.status.%s.requests",
+			sanitizeMetricValue(cat.Name),
+			sanitizeMetricValue(feature),
+			sanitizeMetricValue(cat.RiskLevel),
+			status,
+		)
+	}
+	config.incrementCounter(metricName, 1)
+
+	log.Infof("shadow-ai-detect: matched category=%s feature=%s domain=%s risk=%s status=%s detail=%s",
+		cat.Name, feature, domain, cat.RiskLevel, status, detail)
+
+	// Block in enforcement mode
+	if config.mode == "enforcement" {
+		proxywasm.SendHttpResponseWithDetail(config.blockedCode,
+			"shadow-ai-detect.blocked", nil, []byte(config.blockedMessage), -1)
+		return types.ActionPause
+	}
+
+	return types.ActionContinue
+}
+
+// matchPathPattern checks if the request path starts with any configured LLM API path pattern
+func matchPathPattern(path string, cat CategoryConfig) string {
+	if len(cat.PathPatterns) == 0 {
+		return ""
+	}
+	for _, pattern := range cat.PathPatterns {
+		if strings.HasPrefix(path, pattern) {
+			return pattern
+		}
+	}
+	return ""
 }
 
 // matchDomainWithResult checks if sni or host matches the category, and returns the matched domain
