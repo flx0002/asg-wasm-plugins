@@ -25,12 +25,12 @@ func init() {
 
 // 命中特征类型（IR-001：域名外至少 1 种特征）
 const (
-	featureDomain      = "domain"      // SNI/Host 域名匹配（原有）
-	featurePath        = "path"        // LLM API 特征路径匹配
-	featureJsonBody    = "json_body"   // JSON 载荷结构特征（model/messages/prompt 等字段）
-	featureDomainSSE   = "domain_sse"  // 域名命中 + SSE 流式请求（Accept: text/event-stream）
-	featurePathSSE     = "path_sse"    // 路径命中 + SSE 流式请求
-	acceptSSE          = "text/event-stream"
+	featureDomain    = "domain"     // SNI/Host 域名匹配（原有）
+	featurePath      = "path"       // LLM API 特征路径匹配
+	featureJsonBody  = "json_body"  // JSON 载荷结构特征（model/messages/prompt 等字段）
+	featureDomainSSE = "domain_sse" // 域名命中 + SSE 流式请求（Accept: text/event-stream）
+	featurePathSSE   = "path_sse"   // 路径命中 + SSE 流式请求
+	acceptSSE        = "text/event-stream"
 )
 
 // CategoryConfig defines a category of AI services to detect
@@ -46,13 +46,14 @@ type CategoryConfig struct {
 
 // ShadowAiDetectConfig is the plugin configuration
 type ShadowAiDetectConfig struct {
-	mode              string            // "monitoring" or "enforcement"
-	blockedCode       uint32            // HTTP status code for blocking
-	blockedMessage    string            // response body for blocking
-	enablePathFeature bool              // enable API path feature detection
-	enableBodyFeature bool              // enable JSON body feature detection
-	enableSseFeature  bool              // enable SSE streaming enhancement
-	categories        []CategoryConfig  // AI service categories to detect
+	mode              string           // "monitoring" or "enforcement"
+	blockedCode       uint32           // HTTP status code for blocking
+	blockedMessage    string           // response body for blocking
+	enablePathFeature bool             // enable API path feature detection
+	enableBodyFeature bool             // enable JSON body feature detection
+	enableSseFeature  bool             // enable SSE streaming enhancement
+	categories        []CategoryConfig // AI service categories to detect
+	trustedHosts      []string         // sai-b16: ASG-managed ingress hosts (exact or ".suffix") exempt from path/body feature detection
 	counterMetrics    map[string]proxywasm.MetricCounter
 }
 
@@ -91,6 +92,15 @@ func parseConfig(json gjson.Result, config *ShadowAiDetectConfig, log log.Log) e
 	config.enablePathFeature = !json.Get("enable_path_feature").Exists() || json.Get("enable_path_feature").Bool()
 	config.enableBodyFeature = !json.Get("enable_body_feature").Exists() || json.Get("enable_body_feature").Bool()
 	config.enableSseFeature = !json.Get("enable_sse_feature").Exists() || json.Get("enable_sse_feature").Bool()
+
+	// sai-b16: trusted hosts (ASG-managed ingress domains, e.g. ai-route-*.internal).
+	// Exact match or ".suffix" suffix match. Absent or empty config = no exemption (previous behavior).
+	for _, h := range json.Get("trusted_hosts").Array() {
+		host := strings.ToLower(strings.TrimSpace(h.String()))
+		if host != "" {
+			config.trustedHosts = append(config.trustedHosts, host)
+		}
+	}
 
 	// Parse categories
 	categoriesResult := json.Get("categories")
@@ -198,6 +208,13 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config ShadowAiDetectConfig, 
 		}
 	}
 
+	// sai-b16: trusted host exemption (after domain stage, before content features).
+	// ASG-managed ingress hosts (ai-route-*.internal, demo-llm.local, ...) carry
+	// legitimate AI-gateway traffic whose path/body naturally match content features.
+	if isTrustedHost(host, config) {
+		return types.ActionContinue
+	}
+
 	// Stage 2: API path feature (IR-001 non-domain feature)
 	if config.enablePathFeature && path != "" {
 		for _, cat := range config.categories {
@@ -298,6 +315,26 @@ func reportAndBlock(ctx wrapper.HttpContext, config ShadowAiDetectConfig, cat Ca
 	}
 
 	return types.ActionContinue
+}
+
+// isTrustedHost reports whether host is an ASG-managed ingress host (exact or ".suffix" match).
+func isTrustedHost(host string, config ShadowAiDetectConfig) bool {
+	if host == "" || len(config.trustedHosts) == 0 {
+		return false
+	}
+	for _, t := range config.trustedHosts {
+		if t == "" {
+			continue
+		}
+		if strings.HasPrefix(t, ".") {
+			if strings.HasSuffix(host, t) {
+				return true
+			}
+		} else if host == t {
+			return true
+		}
+	}
+	return false
 }
 
 // matchPathPattern checks if the request path starts with any configured LLM API path pattern
