@@ -15,10 +15,15 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
+	"time"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
@@ -140,6 +145,12 @@ type KeyAuthConfig struct {
 	// 用于影子AI监控模式，使 ai-statistics 能记录消费者身份。
 	identifyOnly bool `yaml:"identify_only"`
 
+	// sai-b15: 无合法消费者身份访问上报目标（Console detect-events 端点）。
+	// 拦截/放行均上报违规事件（blocked/monitored），保证准入动作与审计告警并存。
+	reportFQDN  string `yaml:"report_fqdn"`
+	reportPort  int64  `yaml:"report_port"`
+	reportToken string `yaml:"report_token"`
+
 	credential2Name map[string]string `yaml:"-"`
 }
 
@@ -250,6 +261,20 @@ func parseGlobalConfig(json gjson.Result, global *KeyAuthConfig, log log.Log) er
 			global.credential2Name[credential] = name.String()
 		}
 	}
+	// sai-b15: unauthorized access report target (Console detect-events endpoint)
+	// 默认指向集群内 Console；report_token 需与 Console collector token 一致。
+	if v := json.Get("report_fqdn"); v.Exists() && v.String() != "" {
+		global.reportFQDN = v.String()
+	} else {
+		global.reportFQDN = "higress-console.higress-system.svc.cluster.local"
+	}
+	global.reportPort = 8080
+	if v := json.Get("report_port"); v.Exists() {
+		global.reportPort = int64(v.Int())
+	}
+	if v := json.Get("report_token"); v.Exists() {
+		global.reportToken = v.String()
+	}
 	return nil
 }
 
@@ -310,6 +335,8 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config KeyAuthConfig, log log
 		globalAuthSetTrue  = !globalAuthNoSet && *config.globalAuth
 		globalAuthSetFalse = !globalAuthNoSet && !*config.globalAuth
 	)
+	// sai-b15: 清理前检测客户端伪造的消费者头，作为违规上报的一部分
+	spoofed := hasSpoofedConsumerHeader()
 	clearConsumerHeader()
 
 	// 不需要认证而直接放行的情况：
@@ -351,15 +378,19 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config KeyAuthConfig, log log
 		// identify_only 模式：多 key 不拒绝，直接放行（不设置 x-mse-consumer）
 		if config.identifyOnly {
 			log.Info("identify_only mode: multiple key auth data found, pass through without consumer")
+			reportUnauthorizedAccess(ctx, config, "multi_key", "", spoofed, "monitored", "high", log)
 			return types.ActionContinue
 		}
+		reportUnauthorizedAccess(ctx, config, "multi_key", "", spoofed, "blocked", "critical", log)
 		return deniedMultiKeyAuthData()
 	} else if len(tokens) <= 0 {
 		// identify_only 模式：无 key 不拒绝，直接放行（不设置 x-mse-consumer）
 		if config.identifyOnly {
 			log.Info("identify_only mode: no key auth data found, pass through without consumer")
+			reportUnauthorizedAccess(ctx, config, "no_key", "", spoofed, "monitored", "high", log)
 			return types.ActionContinue
 		}
+		reportUnauthorizedAccess(ctx, config, "no_key", "", spoofed, "blocked", "critical", log)
 		return deniedNoKeyAuthData()
 	}
 
@@ -367,11 +398,14 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config KeyAuthConfig, log log
 	name, ok := config.credential2Name[tokens[0]]
 	if !ok {
 		log.Warnf("credential %q is not configured", tokens[0])
+		fp := keyFingerprint(tokens[0])
 		// identify_only 模式：未知 credential 不拒绝，直接放行（不设置 x-mse-consumer）
 		if config.identifyOnly {
 			log.Info("identify_only mode: unknown credential, pass through without consumer")
+			reportUnauthorizedAccess(ctx, config, "unknown_key", fp, spoofed, "monitored", "high", log)
 			return types.ActionContinue
 		}
+		reportUnauthorizedAccess(ctx, config, "unknown_key", fp, spoofed, "blocked", "critical", log)
 		return deniedUnauthorizedConsumer()
 	}
 
@@ -392,8 +426,10 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config KeyAuthConfig, log log
 			// identify_only 模式：不在 allow 列表也不拒绝，放行（已设置 x-mse-consumer）
 			if config.identifyOnly {
 				log.Infof("identify_only mode: consumer %q not in allow list, pass through anyway", name)
+				reportUnauthorizedAccess(ctx, config, "not_in_allow:"+name, "", spoofed, "monitored", "high", log)
 				return types.ActionContinue
 			}
+			reportUnauthorizedAccess(ctx, config, "not_in_allow:"+name, "", spoofed, "blocked", "critical", log)
 			return deniedUnauthorizedConsumer()
 		}
 		log.Infof("consumer %q authenticated", name)
@@ -408,8 +444,10 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config KeyAuthConfig, log log
 				// identify_only 模式：不在 allow 列表也不拒绝，放行（已设置 x-mse-consumer）
 				if config.identifyOnly {
 					log.Infof("identify_only mode: consumer %q not in allow list, pass through anyway", name)
+					reportUnauthorizedAccess(ctx, config, "not_in_allow:"+name, "", spoofed, "monitored", "high", log)
 					return types.ActionContinue
 				}
+				reportUnauthorizedAccess(ctx, config, "not_in_allow:"+name, "", spoofed, "blocked", "critical", log)
 				return deniedUnauthorizedConsumer()
 			}
 			log.Infof("consumer %q authenticated", name)
@@ -440,6 +478,87 @@ func deniedUnauthorizedConsumer() types.Action {
 
 func authenticated(name string) types.Action {
 	return types.ActionContinue
+}
+
+// sai-b15: 无合法消费者身份访问审计上报。
+// 拦截（blocked/critical）与识别放行（monitored/high）均上报 Console detect-events，
+// 保证"准入动作"与"审计告警"并存；fire-and-forget，上报失败不影响拒绝/放行主流程。
+func reportUnauthorizedAccess(ctx wrapper.HttpContext, config KeyAuthConfig, reason, keyFP string, spoofedHeader bool, status, riskLevel string, log log.Log) {
+	if config.reportFQDN == "" {
+		return
+	}
+	host, err := proxywasm.GetHttpRequestHeader(":authority")
+	if err != nil || host == "" {
+		host, _ = proxywasm.GetHttpRequestHeader("host")
+	}
+	if idx := strings.Index(host, ":"); idx >= 0 {
+		host = host[:idx]
+	}
+	if host == "" {
+		host = "unknown"
+	}
+	srcIp, _ := proxywasm.GetHttpRequestHeader("x-forwarded-for")
+	if srcIp == "" {
+		srcIp = "unknown"
+	}
+	detail, _ := json.Marshal(map[string]interface{}{
+		"reason":         reason,
+		"spoofedHeader":  spoofedHeader,
+		"keyFingerprint": keyFP,
+		"route":          host,
+	})
+	body, _ := json.Marshal(map[string]interface{}{
+		"events": []map[string]interface{}{{
+			"detectType": "unauthorized_access",
+			"domain":     host,
+			"category":   "unknown",
+			"riskLevel":  riskLevel,
+			"status":     status,
+			"source":     "gateway",
+			"srcIp":      srcIp,
+			"detail":     string(detail),
+			"eventTime":  time.Now().UnixMilli(),
+		}},
+	})
+	headers := [][2]string{
+		{"Content-Type", "application/json"},
+	}
+	if config.reportToken != "" {
+		headers = append(headers, [2]string{"X-Collector-Token", config.reportToken})
+	}
+	client := wrapper.NewClusterClient(wrapper.FQDNCluster{FQDN: config.reportFQDN, Port: config.reportPort})
+	dispatchErr := client.Post("/v1/shadow-ai/detect-events", headers, body,
+		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			if statusCode != 200 {
+				log.Errorf("unauthorized access report failed: status=%d body=%s", statusCode, string(responseBody))
+			} else {
+				log.Infof("unauthorized access reported: reason=%s domain=%s", reason, host)
+			}
+		}, 1500)
+	if dispatchErr != nil {
+		log.Errorf("unauthorized access report dispatch error: %v", dispatchErr)
+	}
+}
+
+func keyFingerprint(token string) string {
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
+func hasSpoofedConsumerHeader() bool {
+	hs, err := proxywasm.GetHttpRequestHeaders()
+	if err != nil {
+		return false
+	}
+	for _, h := range hs {
+		if strings.EqualFold(h[0], mseConsumerHeader) || strings.EqualFold(h[0], "x-mse-consumer") {
+			return true
+		}
+	}
+	return false
 }
 
 func contains(arr []string, item string) bool {
