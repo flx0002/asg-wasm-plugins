@@ -353,9 +353,29 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config KeyAuthConfig, log log
 	// - 从 header 中获取 tokens 信息
 	// - 从 query 中获取 tokens 信息
 	var tokens []string
-	if config.InHeader {
+	// sai-s3b3 (IR-038): AI 路由故障转移内部重放兼容 —— Envoy custom_response 内部
+	// 重定向重放请求时 Authorization 已被 ai-proxy 替换为上游 provider apiToken，
+	// 与客户端 x-api-key 并存会误判 multi_key 导致 fallback 重试全部 401。
+	// 重放信号 x-higress-fallback-from 由网关 RedirectPolicy 设置（与 ai-proxy 的
+	// x-hi-original-auth 约定配套）。重放时认证顺序：优先 x-hi-original-auth
+	// （ai-proxy 保存的客户端原始 Authorization），否则跳过 Authorization 仅用
+	// 其余 keys 认证。生产加固：建议在 HCM internal_only_headers 登记该头防伪造。
+	inFallbackReplay := false
+	if v, err := proxywasm.GetHttpRequestHeader("x-higress-fallback-from"); err == nil && v != "" {
+		inFallbackReplay = true
+		// 重放请求的 x-mse-consumer 为网关首轮写入，非客户端伪造
+		spoofed = false
+		if orig, oerr := proxywasm.GetHttpRequestHeader("x-hi-original-auth"); oerr == nil && orig != "" {
+			tokens = append(tokens, strings.TrimPrefix(orig, "Bearer "))
+		}
+	}
+	useOriginalAuthOnly := inFallbackReplay && len(tokens) > 0
+	if config.InHeader && !useOriginalAuthOnly {
 		// 匹配keys中的 keyname
 		for _, key := range config.Keys {
+			if inFallbackReplay && key == "Authorization" {
+				continue
+			}
 			value, err := proxywasm.GetHttpRequestHeader(key)
 			if err == nil && value != "" {
 				tokens = append(tokens, value)
