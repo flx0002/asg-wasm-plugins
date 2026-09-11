@@ -132,6 +132,15 @@ return {current, 1}
 //
 // 返回值：'-1' 表示详情写入失败，其他表示 Session ZSET 当前条数
 const luaAppendAuditLog = `
+-- 安全的 pcall 错误判断：
+-- redis.pcall 失败时返回带 .err 属性的 table；成功时返回的是具体值，
+-- 其类型可能是 string(如 SET 返回 OK) 或 number(如 ZADD/ZCARD 返回计数)。
+-- 直接对 number 取 .err 会因 number 无元表而抛出运行时错误并中断整个脚本，
+-- 导致后续 EXPIRE / 索引写入被静默跳过（R6 审计键无 TTL 的根因）。
+local function isErr(v)
+    return type(v) ==  table and v.err ~= nil
+end
+
 local zsetKey = KEYS[1]
 local logKey = KEYS[2]
 local userKey = KEYS[3]
@@ -149,17 +158,18 @@ local untrustedFlag = ARGV[8]
 local untrustedTtl = tonumber(ARGV[9])
 
 -- 1. 先写入完整日志详情（pcall 容错）
--- 注意：Redis Lua 中 pcall 失败时返回带 .err 属性的 table，而非 false/nil
--- 因此必须检查 res.err，不能用 if not res then 判断
+-- 注意：Redis Lua 中 pcall 失败时返回带 .err 属性的 table，而非 false/nil。
+-- 但成功返回值可能是 number(ZADD/ZCARD)，直接取 .err 会抛错中断脚本，
+-- 因此统一使用 isErr() 安全判断。
 local res2 = redis.pcall('SET', logKey, data, 'EX', ttl)
-if res2.err then
+if isErr(res2) then
     -- 详情写入失败（如 Redis 内存满），直接返回，不写索引，避免脏索引
     return '-1'
 end
 
 -- 2. 详情写入成功，才写 Session ZSET 索引
 local res1 = redis.pcall('ZADD', zsetKey, score, eventId)
-if not res1.err then
+if not isErr(res1) then
     redis.pcall('EXPIRE', zsetKey, ttl)
 end
 
@@ -170,7 +180,7 @@ if userKey ~= '' then
         -- 未信任聚合桶：短 TTL + 限容 10000（防 Key 爆炸）
         redis.pcall('EXPIRE', userKey, untrustedTtl)
         local lenRes = redis.pcall('ZCARD', userKey)
-        if not lenRes.err then
+        if not isErr(lenRes) then
             local len = tonumber(lenRes) or 0
             if len > 10000 then
                 -- ZSET 按 score 升序，排名 0~(len-10001) 为最旧数据
@@ -198,7 +208,7 @@ if callersKey ~= '' and userId ~= '' then
 end
 
 local res3 = redis.pcall('ZCARD', zsetKey)
-if res3.err then
+if isErr(res3) then
     return '1'
 end
 return tostring(res3)

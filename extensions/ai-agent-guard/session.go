@@ -267,6 +267,30 @@ func updateSessionMeta(cfg *config.AgentGuardConfig, rs *RequestState, callback 
 	})
 }
 
+// sensitivePatterns 审计落库前的敏感信息掩码规则（R14 纵深防御）。
+// 插件阶段顺序调整后，审计仍可能读到脱敏前的 body 缓冲，
+// 因此在落库前统一掩码，确保审计记录不留存明文敏感信息。
+// 顺序要求：API Key -> 身份证 -> 银行卡 -> 手机号 -> 邮箱。
+// 身份证(18位)须先于银行卡(16~19位)匹配，否则会被误判为卡号。
+var sensitivePatterns = []struct {
+	re   *regexp.Regexp
+	repl string
+}{
+	{regexp.MustCompile(`sk-[A-Za-z0-9_-]{16,}`), "[KEY_REDACTED]"},
+	{regexp.MustCompile(`\d{17}[\dXx]`), "[ID_REDACTED]"},
+	{regexp.MustCompile(`\d{16,19}`), "[CARD_REDACTED]"},
+	{regexp.MustCompile(`1[3-9]\d{9}`), "[PHONE_REDACTED]"},
+	{regexp.MustCompile(`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`), "[EMAIL_REDACTED]"},
+}
+
+// maskSensitive 对审计留存内容做敏感信息掩码，避免明文落库。
+func maskSensitive(s string) string {
+	for _, p := range sensitivePatterns {
+		s = p.re.ReplaceAllString(s, p.repl)
+	}
+	return s
+}
+
 // recordRequestMetadata 记录请求体元信息
 func recordRequestMetadata(rs *RequestState, body []byte) {
 	if len(body) == 0 {
@@ -280,7 +304,7 @@ func recordRequestMetadata(rs *RequestState, body []byte) {
 	}
 
 	// 记录脱敏后的请求正文（审计取证用，不落原始敏感内容）
-	rs.RequestBodyContent = truncateAndSanitize(string(body), MaxRequestBodyContentLength)
+	rs.RequestBodyContent = maskSensitive(truncateAndSanitize(string(body), MaxRequestBodyContentLength))
 }
 
 // captureTokenUsage 从 SSE 流式响应中捕获 Token 用量

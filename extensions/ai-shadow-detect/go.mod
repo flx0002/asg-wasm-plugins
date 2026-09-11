@@ -1,4 +1,4 @@
-module github.com/alibaba/higress/plugins/wasm-go/extensions/shadow-ai-detect
+module github.com/alibaba/higress/plugins/wasm-go/extensions/ai-shadow-detect
 
 go 1.24.1
 

@@ -518,6 +518,7 @@ func reportUnauthorizedAccess(ctx wrapper.HttpContext, config KeyAuthConfig, rea
 		host = "unknown"
 	}
 	srcIp, _ := proxywasm.GetHttpRequestHeader("x-forwarded-for")
+	sessionID, _ := proxywasm.GetHttpRequestHeader("x-agent-session-id")
 	if srcIp == "" {
 		srcIp = "unknown"
 	}
@@ -536,6 +537,7 @@ func reportUnauthorizedAccess(ctx wrapper.HttpContext, config KeyAuthConfig, rea
 			"status":     status,
 			"source":     "gateway",
 			"srcIp":      srcIp,
+			"sessionId":  sessionID,
 			"detail":     string(detail),
 			"eventTime":  time.Now().UnixMilli(),
 		}},
@@ -547,7 +549,7 @@ func reportUnauthorizedAccess(ctx wrapper.HttpContext, config KeyAuthConfig, rea
 		headers = append(headers, [2]string{"X-Collector-Token", config.reportToken})
 	}
 	client := wrapper.NewClusterClient(wrapper.FQDNCluster{FQDN: config.reportFQDN, Port: config.reportPort})
-	dispatchErr := client.Post("/v1/shadow-ai/detect-events", headers, body,
+	dispatchErr := client.Post("/v1/ai-shadow/detect-events", headers, body,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 			if statusCode != 200 {
 				log.Errorf("unauthorized access report failed: status=%d body=%s", statusCode, string(responseBody))

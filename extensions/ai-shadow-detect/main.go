@@ -16,7 +16,7 @@ func main() {}
 
 func init() {
 	wrapper.SetCtx(
-		"shadow-ai-detect",
+		"ai-shadow-detect",
 		wrapper.ParseConfigBy(parseConfig),
 		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
 		wrapper.ProcessRequestBody(onHttpRequestBody),
@@ -44,8 +44,8 @@ type CategoryConfig struct {
 	BodyFeatures []string // JSON body feature fields, e.g. "model", "messages"
 }
 
-// ShadowAiDetectConfig is the plugin configuration
-type ShadowAiDetectConfig struct {
+// AiShadowDetectConfig is the plugin configuration
+type AiShadowDetectConfig struct {
 	mode              string           // "monitoring" or "enforcement"
 	blockedCode       uint32           // HTTP status code for blocking
 	blockedMessage    string           // response body for blocking
@@ -65,9 +65,9 @@ type hitResult struct {
 	detail   string // matched value for logging (path or body field)
 }
 
-const ctxHitKey = "shadow-ai-hit"
+const ctxHitKey = "ai-shadow-hit"
 
-func parseConfig(json gjson.Result, config *ShadowAiDetectConfig, log log.Log) error {
+func parseConfig(json gjson.Result, config *AiShadowDetectConfig, log log.Log) error {
 	// Parse mode
 	config.mode = json.Get("mode").String()
 	if config.mode == "" {
@@ -159,7 +159,7 @@ func parseConfig(json gjson.Result, config *ShadowAiDetectConfig, log log.Log) e
 	return nil
 }
 
-func onHttpRequestHeaders(ctx wrapper.HttpContext, config ShadowAiDetectConfig, log log.Log) types.Action {
+func onHttpRequestHeaders(ctx wrapper.HttpContext, config AiShadowDetectConfig, log log.Log) types.Action {
 	if len(config.categories) == 0 {
 		return types.ActionContinue
 	}
@@ -242,7 +242,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config ShadowAiDetectConfig, 
 	return types.ActionContinue
 }
 
-func onHttpRequestBody(ctx wrapper.HttpContext, config ShadowAiDetectConfig, body []byte) types.Action {
+func onHttpRequestBody(ctx wrapper.HttpContext, config AiShadowDetectConfig, body []byte) types.Action {
 	// Only run when headers stage did not hit (checked via context marker)
 	marker := ctx.GetContext(ctxHitKey)
 	if marker != "pending" {
@@ -270,7 +270,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config ShadowAiDetectConfig, bod
 
 // reportAndBlock emits the detection metric + log and blocks in enforcement mode.
 // Monitoring mode always continues; the ctx hit marker prevents duplicate body detection.
-func reportAndBlock(ctx wrapper.HttpContext, config ShadowAiDetectConfig, cat CategoryConfig,
+func reportAndBlock(ctx wrapper.HttpContext, config AiShadowDetectConfig, cat CategoryConfig,
 	feature, domain, detail string) types.Action {
 
 	// Mark hit so the body callback skips duplicate detection
@@ -288,14 +288,14 @@ func reportAndBlock(ctx wrapper.HttpContext, config ShadowAiDetectConfig, cat Ca
 	var metricName string
 	switch feature {
 	case featureDomain, featureDomainSSE:
-		metricName = fmt.Sprintf("shadow_ai_detect.category.%s.domain.%s.risk.%s.status.%s.requests",
+		metricName = fmt.Sprintf("ai_shadow_detect.category.%s.domain.%s.risk.%s.status.%s.requests",
 			sanitizeMetricValue(cat.Name),
 			sanitizeMetricValue(domain),
 			sanitizeMetricValue(cat.RiskLevel),
 			status,
 		)
 	default:
-		metricName = fmt.Sprintf("shadow_ai_detect.category.%s.feature.%s.risk.%s.status.%s.requests",
+		metricName = fmt.Sprintf("ai_shadow_detect.category.%s.feature.%s.risk.%s.status.%s.requests",
 			sanitizeMetricValue(cat.Name),
 			sanitizeMetricValue(feature),
 			sanitizeMetricValue(cat.RiskLevel),
@@ -304,13 +304,13 @@ func reportAndBlock(ctx wrapper.HttpContext, config ShadowAiDetectConfig, cat Ca
 	}
 	config.incrementCounter(metricName, 1)
 
-	log.Infof("shadow-ai-detect: matched category=%s feature=%s domain=%s risk=%s status=%s detail=%s",
+	log.Infof("ai-shadow-detect: matched category=%s feature=%s domain=%s risk=%s status=%s detail=%s",
 		cat.Name, feature, domain, cat.RiskLevel, status, detail)
 
 	// Block in enforcement mode
 	if config.mode == "enforcement" {
 		proxywasm.SendHttpResponseWithDetail(config.blockedCode,
-			"shadow-ai-detect.blocked", nil, []byte(config.blockedMessage), -1)
+			"ai-shadow-detect.blocked", nil, []byte(config.blockedMessage), -1)
 		return types.ActionPause
 	}
 
@@ -318,7 +318,7 @@ func reportAndBlock(ctx wrapper.HttpContext, config ShadowAiDetectConfig, cat Ca
 }
 
 // isTrustedHost reports whether host is an ASG-managed ingress host (exact or ".suffix" match).
-func isTrustedHost(host string, config ShadowAiDetectConfig) bool {
+func isTrustedHost(host string, config AiShadowDetectConfig) bool {
 	if host == "" || len(config.trustedHosts) == 0 {
 		return false
 	}
@@ -370,7 +370,7 @@ func matchDomainWithResult(sni, host string, cat CategoryConfig) (bool, string) 
 	return false, ""
 }
 
-func (config *ShadowAiDetectConfig) incrementCounter(metricName string, inc uint64) {
+func (config *AiShadowDetectConfig) incrementCounter(metricName string, inc uint64) {
 	if inc == 0 {
 		return
 	}

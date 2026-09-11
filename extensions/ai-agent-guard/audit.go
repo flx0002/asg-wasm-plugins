@@ -100,7 +100,7 @@ func writeAuditLog(ctx wrapper.HttpContext, cfg *config.AgentGuardConfig, rs *Re
 	if !effectiveCfg.Enabled || !shouldRecord(effectiveCfg, rs) {
 		return
 	}
-	if cfg.RedisClient.Ready() {
+	if cfg != nil && cfg.RedisClient != nil && cfg.RedisClient.Ready() {
 		writeAuditToRedis(cfg, effectiveCfg, rs, entry)
 	}
 }

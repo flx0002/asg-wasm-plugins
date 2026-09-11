@@ -53,6 +53,10 @@ type PromptGuardConfig struct {
 	DenyMessage string `json:"deny_message"`
 	// CaseSensitive indicates whether pattern matching is case-sensitive
 	CaseSensitive bool `json:"case_sensitive"`
+	// EnableNormalization enables decoding (rot13/base64/unicode/url/hex) before deny matching
+	EnableNormalization bool `json:"enable_normalization"`
+	// MaxDecodeCandidates limits the number of decode candidates
+	MaxDecodeCandidates int `json:"max_decode_candidates"`
 
 	// Compiled patterns (internal use)
 	compiledDenyPatterns  []*regexp.Regexp
@@ -64,6 +68,15 @@ func parseConfig(json gjson.Result, config *PromptGuardConfig) error {
 	config.DenyCode = 403
 	config.DenyMessage = "Request blocked by prompt guard"
 	config.CaseSensitive = false
+	config.EnableNormalization = true
+	config.MaxDecodeCandidates = defaultMaxCandidates
+
+	if json.Get("enable_normalization").Exists() {
+		config.EnableNormalization = json.Get("enable_normalization").Bool()
+	}
+	if json.Get("max_decode_candidates").Exists() {
+		config.MaxDecodeCandidates = int(json.Get("max_decode_candidates").Int())
+	}
 
 	// Parse deny_code
 	if json.Get("deny_code").Exists() {
@@ -154,16 +167,20 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PromptGuardConfig, body [
 			continue
 		}
 
-		// Check if content matches deny patterns
-		if matchesAnyPattern(content, config.compiledDenyPatterns) {
-			log.Infof("Malicious prompt detected, blocking request")
+		// Check deny patterns: plain text first, then decoded variants (R3)
+		if hit, method := detectMalicious(content, config); hit {
+			log.Infof("Malicious prompt detected (method=%s), blocking request", method)
+			detail := "Detected prompt injection / jailbreak pattern in user message"
+			if method != "plain" {
+				detail = detail + " (decoded via " + method + ")"
+			}
 			// 写入安全事件到 Dynamic Metadata，供 ai-agent-guard 收集并记录审计日志
 			appendSecurityEvent(SecurityEvent{
 				Type:     "prompt_injection",
 				Severity: "high",
 				Source:   "ai-prompt-guard",
 				Score:    80,
-				Detail:   "Detected prompt injection / jailbreak pattern in user message",
+				Detail:   detail,
 			})
 			sendDenyResponse(config.DenyCode, config.DenyMessage)
 			return types.ActionContinue
@@ -171,6 +188,26 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PromptGuardConfig, body [
 	}
 
 	return types.ActionContinue
+}
+
+// detectMalicious checks content against deny patterns.
+// Returns (hit, method); method is "plain" or the decoding method that exposed the hit.
+func detectMalicious(content string, config PromptGuardConfig) (bool, string) {
+	if matchesAnyPattern(content, config.compiledDenyPatterns) {
+		return true, "plain"
+	}
+	if !config.EnableNormalization {
+		return false, ""
+	}
+	for _, c := range NormalizeForDetection(content, config.MaxDecodeCandidates) {
+		if c.Method == "original" {
+			continue
+		}
+		if matchesAnyPattern(c.Text, config.compiledDenyPatterns) {
+			return true, c.Method
+		}
+	}
+	return false, ""
 }
 
 // matchesAnyPattern checks if text matches any of the compiled patterns

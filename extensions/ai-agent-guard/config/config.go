@@ -159,12 +159,21 @@ func (c *AuditConfigCache) MarkChecked() {
 }
 
 // GetEffectiveConfig 获取生效的审计配置（优先使用 Redis 运行时配置，其次 Wasm 本地配置）
+// defaultAuditChain 兜底审计配置：当动态缓存与静态配置均不可用时使用。
+// 避免返回 nil 导致调用方解引用 panic（R13 加固）。
+// Enabled=false 表示跳过审计写入，不影响主链路。
+var defaultAuditChain AuditChain
+
 func GetEffectiveConfig(staticCfg *AuditChain) *AuditChain {
 	cached := GlobalAuditConfigCache.Get()
 	if cached != nil {
 		return cached
 	}
-	return staticCfg
+	if staticCfg != nil {
+		return staticCfg
+	}
+	// 兜底：静态配置为 nil 时返回零值默认配置，绝不返回 nil
+	return &defaultAuditChain
 }
 
 // CircuitBreaker 熔断器配置
