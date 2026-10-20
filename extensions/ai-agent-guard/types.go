@@ -84,4 +84,5 @@ type SecurityEvent struct {
 	Score      int    `json:"score"`       // 事件风险分值
 	Detail     string `json:"detail"`      // 事件详情（已脱敏）
 	ToolName   string `json:"tool_name"`   // 相关工具名（可选）
+	Direction  string `json:"direction"`   // 命中方向：request=用户输入侧，response=模型输出侧
 }

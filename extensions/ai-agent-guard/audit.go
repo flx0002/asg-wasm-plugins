@@ -80,6 +80,7 @@ type AuditEvent struct {
 	Source   string `json:"source"`
 	Score    int    `json:"score"`
 	Detail   string `json:"detail"` // 已脱敏、截断
+	Direction string `json:"direction"` // 命中方向：request|response
 }
 
 // writeAuditLog 写入审计日志到 ai_log 和 Redis
@@ -272,7 +273,7 @@ func deduplicateSecurityEvents(events []SecurityEvent) []SecurityEvent {
 	seen := make(map[string]struct{}, len(events))
 	result := make([]SecurityEvent, 0, len(events))
 	for _, event := range events {
-		key := event.Type + "\x00" + event.Source + "\x00" + event.Severity + "\x00" + event.Detail
+		key := event.Type + "\x00" + event.Source + "\x00" + event.Severity + "\x00" + event.Detail + "\x00" + event.Direction
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -335,6 +336,7 @@ func buildAuditEntry(cfg *config.AgentGuardConfig, rs *RequestState) AuditLogEnt
 			Source:   e.Source,
 			Score:    e.Score,
 			Detail:   truncateAndSanitize(e.Detail, MaxDetailLength),
+			Direction: e.Direction,
 		})
 	}
 

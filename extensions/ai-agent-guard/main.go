@@ -457,6 +457,7 @@ func inferSecurityEventsFromResponse(rs *RequestState) {
 				Source:   "ai-pii-guard",
 				Score:    60,
 				Detail:   "PII detected and masked in request: " + piiHeader,
+				Direction: "request",
 			})
 			log.Debugf("inferSecurityEventsFromResponse: inferred pii_leak event from x-pii-detected header: %s", piiHeader)
 		}
@@ -493,6 +494,7 @@ func inferSecurityEventsFromResponse(rs *RequestState) {
 		Source:   "ai-prompt-guard",
 		Score:    80,
 		Detail:   "Detected prompt injection / jailbreak pattern in user message",
+		Direction: "request",
 	})
 	// 更新拦截标记
 	rs.Blocked = true
@@ -528,6 +530,7 @@ func collectPIIEventsFromHeaders(rs *RequestState) {
 		Source:   "ai-pii-guard",
 		Score:    60,
 		Detail:   "PII detected and masked in request: " + piiHeader,
+		Direction: "request",
 	})
 	log.Debugf("collectPIIEventsFromHeaders: detected PII rules=%s from x-pii-detected header", piiHeader)
 }
