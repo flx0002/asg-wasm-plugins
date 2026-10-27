@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
@@ -33,6 +35,18 @@ const (
 	acceptSSE        = "text/event-stream"
 )
 
+// detect-events 的 detectType 取值（Console 侧原样存储、原样展示）
+const (
+	detectTypeAccess       = "gateway_ai_access"           // 域名/路径/载荷维度命中
+	detectTypeUnauthorized = "gateway_unauthorized_access" // AI 路由上的未认证访问
+)
+
+// 默认上报目标：集群内 Console（与 key-auth 的 sai-b15 保持一致）
+const (
+	defaultReportFQDN = "higress-console.higress-system.svc.cluster.local"
+	defaultReportPort = 8080
+)
+
 // CategoryConfig defines a category of AI services to detect
 type CategoryConfig struct {
 	Name         string   // e.g. "saas_ai"
@@ -55,6 +69,16 @@ type AiShadowDetectConfig struct {
 	categories        []CategoryConfig // AI service categories to detect
 	trustedHosts      []string         // sai-b16: ASG-managed ingress hosts (exact or ".suffix") exempt from path/body feature detection
 	counterMetrics    map[string]proxywasm.MetricCounter
+
+	// sai-b17: detect-events 上报。页面（「检测到的AI服务访问」/KPI/趋势）读的是
+	// ai_shadow_detect_event 表，只打 Prometheus 指标不会出现在页面上，故必须逐条上报。
+	reportFQDN  string
+	reportPort  int64
+	reportToken string
+
+	// sai-b18: 认证维度检测。trusted_hosts 覆盖的 ASG 托管 AI 路由上，
+	// 没有 x-mse-consumer（key-auth 已认证标识）的访问视为未认证影子 AI。
+	enableAuthzFeature bool
 }
 
 // hitResult records a detection hit with its feature type
@@ -101,6 +125,21 @@ func parseConfig(json gjson.Result, config *AiShadowDetectConfig, log log.Log) e
 			config.trustedHosts = append(config.trustedHosts, host)
 		}
 	}
+
+	// sai-b17: detect-events 上报目标。默认指向集群内 Console；
+	// report_token 必须与 Console 的 collector token 一致，否则上报被拒。
+	config.reportFQDN = strings.TrimSpace(json.Get("report_fqdn").String())
+	if config.reportFQDN == "" {
+		config.reportFQDN = defaultReportFQDN
+	}
+	config.reportPort = json.Get("report_port").Int()
+	if config.reportPort <= 0 {
+		config.reportPort = defaultReportPort
+	}
+	config.reportToken = json.Get("report_token").String()
+
+	// sai-b18: 认证维度开关，默认开启；现场可用 enable_authz_feature=false 单独关闭。
+	config.enableAuthzFeature = !json.Get("enable_authz_feature").Exists() || json.Get("enable_authz_feature").Bool()
 
 	// Parse categories
 	categoriesResult := json.Get("categories")
@@ -161,6 +200,7 @@ func parseConfig(json gjson.Result, config *AiShadowDetectConfig, log log.Log) e
 
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config AiShadowDetectConfig, log log.Log) types.Action {
 	if len(config.categories) == 0 {
+		// 认证维度（sai-b18）同样依赖 categories 做 path 门禁，没有分类就无从判定
 		return types.ActionContinue
 	}
 
@@ -204,14 +244,30 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config AiShadowDetectConfig, 
 			if wantsSSE {
 				feature = featureDomainSSE
 			}
-			return reportAndBlock(ctx, config, cat, feature, matchedDomain, matchedDomain)
+			return reportAndBlock(ctx, config, cat, host, feature, matchedDomain, matchedDomain)
 		}
 	}
 
 	// sai-b16: trusted host exemption (after domain stage, before content features).
 	// ASG-managed ingress hosts (ai-route-*.internal, demo-llm.local, ...) carry
 	// legitimate AI-gateway traffic whose path/body naturally match content features.
+	//
+	// sai-b18: 认证维度在豁免之前插入。trusted_hosts 覆盖的正是 ASG 托管的 AI 路由，
+	// 这类路由上 key-auth 认证成功才会写入 x-mse-consumer；没有该头说明这次访问
+	// 未经认证，属于影子 AI。这里只上报不阻断：认证拒绝由 key-auth（AUTHN 阶段）
+	// 负责，插件处在 AUTHZ 阶段，只能看到已经被放行的请求，重复阻断会掩盖真实原因。
+	// 用 path 特征作为「确实是一次 AI API 调用」的门禁，避免浏览器 favicon 之类的
+	// 普通请求把事件表灌满。
 	if isTrustedHost(host, config) {
+		if config.enableAuthzFeature && path != "" && !isAuthenticated() {
+			for _, cat := range config.categories {
+				if matchedPattern := matchPathPattern(path, cat); matchedPattern != "" {
+					reportDetectEvent(config, detectTypeUnauthorized, host, cat.Name, cat.RiskLevel,
+						"allowed", "ai_route_unauthenticated pattern="+matchedPattern+" path="+path)
+					break
+				}
+			}
+		}
 		return types.ActionContinue
 	}
 
@@ -223,7 +279,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config AiShadowDetectConfig, 
 				if wantsSSE {
 					feature = featurePathSSE
 				}
-				return reportAndBlock(ctx, config, cat, feature, matchedPattern, path)
+				return reportAndBlock(ctx, config, cat, host, feature, matchedPattern, path)
 			}
 		}
 	}
@@ -252,6 +308,12 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AiShadowDetectConfig, bod
 		return types.ActionContinue
 	}
 
+	// 事件表的 domain 取请求的 :authority（headers 阶段已剥端口），body 阶段需重新读取
+	host := ""
+	if h, err := proxywasm.GetHttpRequestHeader(":authority"); err == nil {
+		host = strings.ToLower(stripPortFromHost(h))
+	}
+
 	// JSON body feature: look up configured fields (gjson path semantics)
 	for _, cat := range config.categories {
 		if len(cat.BodyFeatures) == 0 {
@@ -260,7 +322,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AiShadowDetectConfig, bod
 		for _, field := range cat.BodyFeatures {
 			// gjson field lookup: top-level or nested (e.g. "model", "messages", "input.prompt")
 			if gjson.GetBytes(body, field).Exists() {
-				return reportAndBlock(ctx, config, cat, featureJsonBody, field, string(body))
+				return reportAndBlock(ctx, config, cat, host, featureJsonBody, field, string(body))
 			}
 		}
 	}
@@ -270,8 +332,10 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AiShadowDetectConfig, bod
 
 // reportAndBlock emits the detection metric + log and blocks in enforcement mode.
 // Monitoring mode always continues; the ctx hit marker prevents duplicate body detection.
+// host 是请求的 :authority（已剥端口），作为事件表的 domain 写入；domain 是命中的
+// 特征值（域名 / 路径模式 / JSON 字段），只用于指标维度与日志。
 func reportAndBlock(ctx wrapper.HttpContext, config AiShadowDetectConfig, cat CategoryConfig,
-	feature, domain, detail string) types.Action {
+	host, feature, domain, detail string) types.Action {
 
 	// Mark hit so the body callback skips duplicate detection
 	ctx.SetContext(ctxHitKey, "hit")
@@ -307,6 +371,11 @@ func reportAndBlock(ctx wrapper.HttpContext, config AiShadowDetectConfig, cat Ca
 	log.Infof("ai-shadow-detect: matched category=%s feature=%s domain=%s risk=%s status=%s detail=%s",
 		cat.Name, feature, domain, cat.RiskLevel, status, detail)
 
+	// sai-b17: 持久化到事件表。页面三处取数（列表/KPI/趋势）读的都是
+	// ai_shadow_detect_event，只打指标不会出现在页面上。
+	reportDetectEvent(config, detectTypeAccess, host, cat.Name, cat.RiskLevel, status,
+		"feature="+feature+" matched="+domain)
+
 	// Block in enforcement mode
 	if config.mode == "enforcement" {
 		proxywasm.SendHttpResponseWithDetail(config.blockedCode,
@@ -315,6 +384,68 @@ func reportAndBlock(ctx wrapper.HttpContext, config AiShadowDetectConfig, cat Ca
 	}
 
 	return types.ActionContinue
+}
+
+// isAuthenticated reports whether key-auth (AUTHN stage, runs before this plugin)
+// resolved a consumer identity for this request. key-auth only writes the header
+// after successful authentication, so an absent/empty header means unauthenticated.
+func isAuthenticated() bool {
+	consumer, err := proxywasm.GetHttpRequestHeader("x-mse-consumer")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(consumer) != ""
+}
+
+// reportDetectEvent posts a single detection event to the Console event store
+// (POST /v1/ai-shadow/detect-events). Best-effort and asynchronous: a failure only
+// logs, it never changes the detection decision on the request path.
+// 这里用包级 log（与 reportAndBlock 一致）：该函数没有 log.Log 实例可传。
+func reportDetectEvent(config AiShadowDetectConfig, detectType, domain, category,
+	risk, status, detail string) {
+	if config.reportFQDN == "" || strings.TrimSpace(domain) == "" {
+		return
+	}
+	srcIP, _ := proxywasm.GetHttpRequestHeader("x-forwarded-for")
+	if i := strings.Index(srcIP, ","); i != -1 {
+		srcIP = srcIP[:i]
+	}
+	srcIP = strings.TrimSpace(srcIP)
+	if srcIP == "" {
+		srcIP = "unknown"
+	}
+	sessionID, _ := proxywasm.GetHttpRequestHeader("x-agent-session-id")
+	body, err := json.Marshal(map[string]interface{}{
+		"events": []map[string]interface{}{{
+			"detectType": detectType,
+			"domain":     domain,
+			"category":   category,
+			"riskLevel":  risk,
+			"status":     status,
+			"source":     "gateway",
+			"srcIp":      srcIP,
+			"sessionId":  sessionID,
+			"detail":     detail,
+			"eventTime":  time.Now().UnixMilli(),
+		}},
+	})
+	if err != nil {
+		log.Errorf("ai-shadow-detect: build report body failed: %v", err)
+		return
+	}
+	headers := [][2]string{{"Content-Type", "application/json"}}
+	if config.reportToken != "" {
+		headers = append(headers, [2]string{"X-Collector-Token", config.reportToken})
+	}
+	client := wrapper.NewClusterClient(wrapper.FQDNCluster{FQDN: config.reportFQDN, Port: config.reportPort})
+	if dispatchErr := client.Post("/v1/ai-shadow/detect-events", headers, body,
+		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			if statusCode != http.StatusOK {
+				log.Errorf("ai-shadow-detect: report rejected status=%d body=%s", statusCode, string(responseBody))
+			}
+		}, 1500); dispatchErr != nil {
+		log.Errorf("ai-shadow-detect: report dispatch error: %v", dispatchErr)
+	}
 }
 
 // isTrustedHost reports whether host is an ASG-managed ingress host (exact or ".suffix" match).
