@@ -41,10 +41,34 @@ const (
 	detectTypeUnauthorized = "gateway_unauthorized_access" // AI 路由上的未认证访问
 )
 
+// 判定面（L3 归属口径）：通道内的问题进 route，绕道的进 shadow。
+const (
+	surfaceRoute  = "route"
+	surfaceShadow = "shadow"
+)
+
+// verdict 取值。non_shadow 不产生事件（A2 短路直接放行），
+// 字段仍随事件下发，供事件表结构与后续聚合口径统一。
+const verdictShadow = "shadow"
+
+// reason 承载 shadow 的细分原因
+const (
+	reasonOffChannel         = "off_channel"          // 不在已登记通道
+	reasonNoConsumer         = "no_consumer"          // 通道内，但未认证
+	reasonConsumerNotAllowed = "consumer_not_allowed" // 通道内，已认证但未被授权调用该通道
+)
+
 // 默认上报目标：集群内 Console（与 key-auth 的 sai-b15 保持一致）
 const (
 	defaultReportFQDN = "higress-console.higress-system.svc.cluster.local"
 	defaultReportPort = 8080
+)
+
+// A1：S1 判定所用请求头的默认名。可配置是为了避免硬编码，
+// 默认值必须与 AI Route 的 header 匹配注解、key-auth 的写入头保持一致。
+const (
+	defaultRouteHeader    = "x-higress-llm-model"
+	defaultConsumerHeader = "x-asg-consumer-ok"
 )
 
 // CategoryConfig defines a category of AI services to detect
@@ -67,18 +91,22 @@ type AiShadowDetectConfig struct {
 	enableBodyFeature bool             // enable JSON body feature detection
 	enableSseFeature  bool             // enable SSE streaming enhancement
 	categories        []CategoryConfig // AI service categories to detect
-	trustedHosts      []string         // sai-b16: ASG-managed ingress hosts (exact or ".suffix") exempt from path/body feature detection
 	counterMetrics    map[string]proxywasm.MetricCounter
+
+	// A1（2026-10-29）：S1 已登记通道白名单。三个集合全部由 Console 派生下发
+	// （AiChannelDerivationService），不接受手工维护。全部留空时短路不会触发，
+	// 行为与改造前完全一致。
+	aiRouteModels        []string // S1a：AI Route 的 model 头前缀集合（predicate=PRE）
+	aiRouteModelExacts   []string // S1a：AI Route 的 model 头精确集合（predicate=EQUAL）
+	authorizedProxyHosts []string // S1b：已登记代理域名（授权域名 ∩ ingress host）
+	routeHeader          string   // 取 model 的请求头，默认 x-higress-llm-model
+	consumerHeader       string   // key-auth 的授权标记头，默认 x-asg-consumer-ok
 
 	// sai-b17: detect-events 上报。页面（「检测到的AI服务访问」/KPI/趋势）读的是
 	// ai_shadow_detect_event 表，只打 Prometheus 指标不会出现在页面上，故必须逐条上报。
 	reportFQDN  string
 	reportPort  int64
 	reportToken string
-
-	// sai-b18: 认证维度检测。trusted_hosts 覆盖的 ASG 托管 AI 路由上，
-	// 没有 x-mse-consumer（key-auth 已认证标识）的访问视为未认证影子 AI。
-	enableAuthzFeature bool
 }
 
 // hitResult records a detection hit with its feature type
@@ -87,6 +115,21 @@ type hitResult struct {
 	feature  string // one of featureDomain/featurePath/featureJsonBody/featureDomainSSE/featurePathSSE
 	domain   string // matched domain (may be empty for path/body hits)
 	detail   string // matched value for logging (path or body field)
+}
+
+// detectEvent 是一条上报事件。用结构体而不是位置参数：
+// 字段已有 11 个，位置参数极易传错顺序，且后续还会加。
+type detectEvent struct {
+	detectType string
+	host       string // 请求的 :authority（已剥端口）
+	category   string
+	risk       string
+	status     string
+	detail     string
+	surface    string // route | shadow
+	verdict    string // shadow（non_shadow 不上报）
+	reason     string // off_channel | no_consumer | consumer_not_allowed
+	routeHint  string // 命中的通道依据，如 model=mock-llm / host=www.deepseek.com
 }
 
 const ctxHitKey = "ai-shadow-hit"
@@ -117,13 +160,29 @@ func parseConfig(json gjson.Result, config *AiShadowDetectConfig, log log.Log) e
 	config.enableBodyFeature = !json.Get("enable_body_feature").Exists() || json.Get("enable_body_feature").Bool()
 	config.enableSseFeature = !json.Get("enable_sse_feature").Exists() || json.Get("enable_sse_feature").Bool()
 
-	// sai-b16: trusted hosts (ASG-managed ingress domains, e.g. ai-route-*.internal).
-	// Exact match or ".suffix" suffix match. Absent or empty config = no exemption (previous behavior).
-	for _, h := range json.Get("trusted_hosts").Array() {
-		host := strings.ToLower(strings.TrimSpace(h.String()))
-		if host != "" {
-			config.trustedHosts = append(config.trustedHosts, host)
+	// A1：S1 白名单。空值必须过滤掉——空前缀会前缀匹配所有 model，等于全域放行。
+	for _, m := range json.Get("ai_route_models").Array() {
+		if v := strings.TrimSpace(m.String()); v != "" {
+			config.aiRouteModels = append(config.aiRouteModels, v)
 		}
+	}
+	for _, m := range json.Get("ai_route_model_exacts").Array() {
+		if v := strings.TrimSpace(m.String()); v != "" {
+			config.aiRouteModelExacts = append(config.aiRouteModelExacts, v)
+		}
+	}
+	for _, h := range json.Get("authorized_proxy_hosts").Array() {
+		if v := strings.ToLower(strings.TrimSpace(h.String())); v != "" {
+			config.authorizedProxyHosts = append(config.authorizedProxyHosts, v)
+		}
+	}
+	config.routeHeader = strings.TrimSpace(json.Get("route_header").String())
+	if config.routeHeader == "" {
+		config.routeHeader = defaultRouteHeader
+	}
+	config.consumerHeader = strings.TrimSpace(json.Get("consumer_header").String())
+	if config.consumerHeader == "" {
+		config.consumerHeader = defaultConsumerHeader
 	}
 
 	// sai-b17: detect-events 上报目标。默认指向集群内 Console；
@@ -137,9 +196,6 @@ func parseConfig(json gjson.Result, config *AiShadowDetectConfig, log log.Log) e
 		config.reportPort = defaultReportPort
 	}
 	config.reportToken = json.Get("report_token").String()
-
-	// sai-b18: 认证维度开关，默认开启；现场可用 enable_authz_feature=false 单独关闭。
-	config.enableAuthzFeature = !json.Get("enable_authz_feature").Exists() || json.Get("enable_authz_feature").Bool()
 
 	// Parse categories
 	categoriesResult := json.Get("categories")
@@ -198,9 +254,17 @@ func parseConfig(json gjson.Result, config *AiShadowDetectConfig, log log.Log) e
 	return nil
 }
 
+// onHttpRequestHeaders 是 wrapper 的唯一入口：先判定，再把内部头清掉。
+// A4：x-asg-consumer-ok 只供本插件判定，绝不能带到上游（哪怕上游是自有 LLM 网关）。
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config AiShadowDetectConfig, log log.Log) types.Action {
+	action := decideRequestHeaders(ctx, config, log)
+	removeInternalHeaders(config)
+	return action
+}
+
+func decideRequestHeaders(ctx wrapper.HttpContext, config AiShadowDetectConfig, log log.Log) types.Action {
 	if len(config.categories) == 0 {
-		// 认证维度（sai-b18）同样依赖 categories 做 path 门禁，没有分类就无从判定
+		// 认证维度同样依赖 categories 做 path 门禁，没有分类就无从判定
 		return types.ActionContinue
 	}
 
@@ -236,6 +300,17 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config AiShadowDetectConfig, 
 		return types.ActionContinue
 	}
 
+	// A2（2026-10-29）：S1 —— 请求是否落在已登记 AI 通道上。判定式见方案 2.1：
+	//   non_shadow ⟺ S1 ∧ S2  → 合规调用，直接放行且不产生任何事件
+	//   S1 ∧ ¬S2   → 通道内未授权，上报 shadow（surface=route），不阻断
+	// 只有 S1 ∧ S2 才提前放行。S1 ∧ ¬S2 必须继续走域名判定：model-router 会
+	// 用请求体的 model 补写 x-higress-llm-model，若在这里一并放行，
+	// 「绕道公网 AI + body 里写一个内部模型名」就会在 enforcement 下被放过。
+	s1, channelHint := matchedRegisteredChannel(config, host)
+	if s1 && isAuthorizedConsumer(config) {
+		return types.ActionContinue
+	}
+
 	// Stage 1: domain match (existing behavior)
 	for _, cat := range config.categories {
 		matched, matchedDomain := matchDomainWithResult(sni, host, cat)
@@ -248,26 +323,10 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config AiShadowDetectConfig, 
 		}
 	}
 
-	// sai-b16: trusted host exemption (after domain stage, before content features).
-	// ASG-managed ingress hosts (ai-route-*.internal, demo-llm.local, ...) carry
-	// legitimate AI-gateway traffic whose path/body naturally match content features.
-	//
-	// sai-b18: 认证维度在豁免之前插入。trusted_hosts 覆盖的正是 ASG 托管的 AI 路由，
-	// 这类路由上 key-auth 认证成功才会写入 x-mse-consumer；没有该头说明这次访问
-	// 未经认证，属于影子 AI。这里只上报不阻断：认证拒绝由 key-auth（AUTHN 阶段）
-	// 负责，插件处在 AUTHZ 阶段，只能看到已经被放行的请求，重复阻断会掩盖真实原因。
-	// 用 path 特征作为「确实是一次 AI API 调用」的门禁，避免浏览器 favicon 之类的
-	// 普通请求把事件表灌满。
-	if isTrustedHost(host, config) {
-		if config.enableAuthzFeature && path != "" && !isAuthenticated() {
-			for _, cat := range config.categories {
-				if matchedPattern := matchPathPattern(path, cat); matchedPattern != "" {
-					reportDetectEvent(config, detectTypeUnauthorized, host, cat.Name, cat.RiskLevel,
-						"allowed", "ai_route_unauthenticated pattern="+matchedPattern+" path="+path)
-					break
-				}
-			}
-		}
+	// S1 ∧ ¬S2 且域名未命中任何分类：确实是自有通道上的调用，只是没被授权。
+	// 归到 route 面，不做路径/载荷特征判定——那会把自有通道的正常调用重复计成影子。
+	if s1 {
+		reportChannelUnauthorized(config, path, host, channelHint)
 		return types.ActionContinue
 	}
 
@@ -373,8 +432,18 @@ func reportAndBlock(ctx wrapper.HttpContext, config AiShadowDetectConfig, cat Ca
 
 	// sai-b17: 持久化到事件表。页面三处取数（列表/KPI/趋势）读的都是
 	// ai_shadow_detect_event，只打指标不会出现在页面上。
-	reportDetectEvent(config, detectTypeAccess, host, cat.Name, cat.RiskLevel, status,
-		"feature="+feature+" matched="+domain)
+	// 走到这里的请求都没落在已登记通道上，故 surface=shadow、reason=off_channel。
+	reportDetectEvent(config, detectEvent{
+		detectType: detectTypeAccess,
+		host:       host,
+		category:   cat.Name,
+		risk:       cat.RiskLevel,
+		status:     status,
+		detail:     "feature=" + feature + " matched=" + domain,
+		surface:    surfaceShadow,
+		verdict:    verdictShadow,
+		reason:     reasonOffChannel,
+	})
 
 	// Block in enforcement mode
 	if config.mode == "enforcement" {
@@ -386,25 +455,109 @@ func reportAndBlock(ctx wrapper.HttpContext, config AiShadowDetectConfig, cat Ca
 	return types.ActionContinue
 }
 
-// isAuthenticated reports whether key-auth (AUTHN stage, runs before this plugin)
-// resolved a consumer identity for this request. key-auth only writes the header
-// after successful authentication, so an absent/empty header means unauthenticated.
-func isAuthenticated() bool {
+// matchedRegisteredChannel 判断 S1：S1a 命中已登记 AI Route 的 model 头，或 S1b 命中已登记代理域名。
+// 返回命中依据（写入事件的 routeHint，便于定位是哪条通道）。
+// 白名单为空时两个循环都不进入，等价于「不识别任何通道」，即改造前行为。
+func matchedRegisteredChannel(config AiShadowDetectConfig, host string) (bool, string) {
+	if config.routeHeader != "" {
+		if v, err := proxywasm.GetHttpRequestHeader(config.routeHeader); err == nil {
+			model := strings.TrimSpace(v)
+			if model != "" {
+				for _, m := range config.aiRouteModelExacts {
+					if model == m {
+						return true, "model=" + model
+					}
+				}
+				for _, m := range config.aiRouteModels {
+					if strings.HasPrefix(model, m) {
+						return true, "model=" + model
+					}
+				}
+			}
+		}
+	}
+	if host != "" {
+		for _, h := range config.authorizedProxyHosts {
+			if host == h {
+				return true, "host=" + host
+			}
+		}
+	}
+	return false, ""
+}
+
+// isAuthorizedConsumer 判断 S2：既已认证（x-mse-consumer），又通过 allow 校验
+// （x-asg-consumer-ok=true，仅在 key-auth 的 allow 命中分支写入）。
+// 只有 S2a 不够：identify_only 模式下「认证了但不在 allow」也会被放行。
+func isAuthorizedConsumer(config AiShadowDetectConfig) bool {
 	consumer, err := proxywasm.GetHttpRequestHeader("x-mse-consumer")
+	if err != nil || strings.TrimSpace(consumer) == "" {
+		return false
+	}
+	ok, err := proxywasm.GetHttpRequestHeader(config.consumerHeader)
 	if err != nil {
 		return false
 	}
-	return strings.TrimSpace(consumer) != ""
+	return strings.EqualFold(strings.TrimSpace(ok), "true")
+}
+
+// reportChannelUnauthorized 上报「已登记通道上的未授权调用」。
+// 用 KB 的 path 特征做门禁，避免 favicon 之类普通请求把事件表灌满（与 sai-b18 一致）。
+// 只上报、不阻断：认证拒绝由 key-auth（AUTHN 阶段）负责，插件处在 AUTHZ 阶段
+// 只能看到已被放行的请求，重复阻断会掩盖真实原因。
+func reportChannelUnauthorized(config AiShadowDetectConfig, path, host, channelHint string) {
+	if path == "" {
+		return
+	}
+	// 到这里 S2 一定不成立：要么没有身份，要么有身份但没通过 allow。
+	reason := reasonNoConsumer
+	if consumer, err := proxywasm.GetHttpRequestHeader("x-mse-consumer"); err == nil &&
+		strings.TrimSpace(consumer) != "" {
+		reason = reasonConsumerNotAllowed
+	}
+	for _, cat := range config.categories {
+		matchedPattern := matchPathPattern(path, cat)
+		if matchedPattern == "" {
+			continue
+		}
+		reportDetectEvent(config, detectEvent{
+			detectType: detectTypeUnauthorized,
+			host:       host,
+			category:   cat.Name,
+			risk:       cat.RiskLevel,
+			status:     "allowed",
+			detail:     "reason=" + reason + " " + channelHint + " pattern=" + matchedPattern + " path=" + path,
+			surface:    surfaceRoute,
+			verdict:    verdictShadow,
+			reason:     reason,
+			routeHint:  channelHint,
+		})
+		return
+	}
+}
+
+// removeInternalHeaders 删除只供网关内部判定用的请求头，避免泄漏到上游。
+func removeInternalHeaders(config AiShadowDetectConfig) {
+	if config.consumerHeader == "" {
+		return
+	}
+	// 未认证请求本来就没有该头，删除失败属正常情况
+	_ = proxywasm.RemoveHttpRequestHeader(config.consumerHeader)
 }
 
 // reportDetectEvent posts a single detection event to the Console event store
 // (POST /v1/ai-shadow/detect-events). Best-effort and asynchronous: a failure only
 // logs, it never changes the detection decision on the request path.
 // 这里用包级 log（与 reportAndBlock 一致）：该函数没有 log.Log 实例可传。
-func reportDetectEvent(config AiShadowDetectConfig, detectType, domain, category,
-	risk, status, detail string) {
-	if config.reportFQDN == "" || strings.TrimSpace(domain) == "" {
+func reportDetectEvent(config AiShadowDetectConfig, ev detectEvent) {
+	if config.reportFQDN == "" {
 		return
+	}
+	// A4：Host 为空时必须落 unknown。原逻辑在这里直接 return，
+	// 相当于「没有 Host 的命中全部静默丢弃」，是一处静默漏检。
+	host := strings.TrimSpace(ev.host)
+	if host == "" {
+		host = "unknown"
 	}
 	srcIP, _ := proxywasm.GetHttpRequestHeader("x-forwarded-for")
 	if i := strings.Index(srcIP, ","); i != -1 {
@@ -417,15 +570,19 @@ func reportDetectEvent(config AiShadowDetectConfig, detectType, domain, category
 	sessionID, _ := proxywasm.GetHttpRequestHeader("x-agent-session-id")
 	body, err := json.Marshal(map[string]interface{}{
 		"events": []map[string]interface{}{{
-			"detectType": detectType,
-			"domain":     domain,
-			"category":   category,
-			"riskLevel":  risk,
-			"status":     status,
+			"detectType": ev.detectType,
+			"domain":     host,
+			"category":   ev.category,
+			"riskLevel":  ev.risk,
+			"status":     ev.status,
 			"source":     "gateway",
 			"srcIp":      srcIP,
 			"sessionId":  sessionID,
-			"detail":     detail,
+			"detail":     ev.detail,
+			"surface":    ev.surface,
+			"verdict":    ev.verdict,
+			"reason":     ev.reason,
+			"routeHint":  ev.routeHint,
 			"eventTime":  time.Now().UnixMilli(),
 		}},
 	})
@@ -446,26 +603,6 @@ func reportDetectEvent(config AiShadowDetectConfig, detectType, domain, category
 		}, 1500); dispatchErr != nil {
 		log.Errorf("ai-shadow-detect: report dispatch error: %v", dispatchErr)
 	}
-}
-
-// isTrustedHost reports whether host is an ASG-managed ingress host (exact or ".suffix" match).
-func isTrustedHost(host string, config AiShadowDetectConfig) bool {
-	if host == "" || len(config.trustedHosts) == 0 {
-		return false
-	}
-	for _, t := range config.trustedHosts {
-		if t == "" {
-			continue
-		}
-		if strings.HasPrefix(t, ".") {
-			if strings.HasSuffix(host, t) {
-				return true
-			}
-		} else if host == t {
-			return true
-		}
-	}
-	return false
 }
 
 // matchPathPattern checks if the request path starts with any configured LLM API path pattern
