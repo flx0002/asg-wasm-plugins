@@ -39,6 +39,12 @@ var (
 
 const mseConsumerHeader = "X-Mse-Consumer"
 
+// consumerOkHeader marks "authenticated AND allowed" (allow-list check passed),
+// which x-mse-consumer alone does not prove: in identify_only mode a consumer
+// that is not in the allow list still passes through with x-mse-consumer set.
+// ai-shadow-detect reads it as the S2b signal of a non-shadow verdict.
+const consumerOkHeader = "X-Asg-Consumer-Ok"
+
 func main() {}
 
 func init() {
@@ -157,6 +163,9 @@ type KeyAuthConfig struct {
 func clearConsumerHeader() {
 	_ = proxywasm.RemoveHttpRequestHeader(mseConsumerHeader)
 	_ = proxywasm.RemoveHttpRequestHeader("x-mse-consumer")
+	// Client-supplied values must never reach ai-shadow-detect, so the ok header
+	// is stripped before this plugin writes its own trusted value.
+	_ = proxywasm.RemoveHttpRequestHeader(consumerOkHeader)
 }
 
 func parseGlobalConfig(json gjson.Result, global *KeyAuthConfig, log log.Log) error {
@@ -496,7 +505,11 @@ func deniedUnauthorizedConsumer() types.Action {
 	return types.ActionContinue
 }
 
+// authenticated is called ONLY after the consumer passed authentication and the
+// allow-list check (all three call sites sit behind the allow branch), so writing
+// consumerOkHeader here makes the S2b signal exactly equal to "authorized consumer".
 func authenticated(name string) types.Action {
+	proxywasm.AddHttpRequestHeader(consumerOkHeader, "true")
 	return types.ActionContinue
 }
 
@@ -576,7 +589,8 @@ func hasSpoofedConsumerHeader() bool {
 		return false
 	}
 	for _, h := range hs {
-		if strings.EqualFold(h[0], mseConsumerHeader) || strings.EqualFold(h[0], "x-mse-consumer") {
+		if strings.EqualFold(h[0], mseConsumerHeader) || strings.EqualFold(h[0], "x-mse-consumer") ||
+			strings.EqualFold(h[0], consumerOkHeader) {
 			return true
 		}
 	}
