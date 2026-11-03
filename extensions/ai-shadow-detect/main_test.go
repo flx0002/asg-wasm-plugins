@@ -138,3 +138,86 @@ func TestSanitizeMetricValue(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeAuthorizedDomain(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"Example.COM", "example.com"},
+		{"  demo-llm.local  ", "demo-llm.local"},
+		{"*.example.com", "example.com"},
+		{".example.com", "example.com"},
+		{"*.EXAMPLE.com", "example.com"},
+		{"example.com.", "example.com"},
+		{"example.com..", "example.com"},
+		{"127.0.0.1", "127.0.0.1"},
+		{"", ""},
+		{"...", ""},
+	}
+	for _, c := range cases {
+		if got := normalizeAuthorizedDomain(c.in); got != c.want {
+			t.Errorf("normalizeAuthorizedDomain(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestIsDomainAuthorized(t *testing.T) {
+	authorized := []string{"abc.com", "demo-llm.local", "deepseek.com", "127.0.0.1"}
+	cases := []struct {
+		host string
+		want bool
+	}{
+		{"127.0.0.1", true},           // IP 精确命中
+		{"demo-llm.local", true},      // 精确命中
+		{"deepseek.com.", true},       // 尾点 FQDN 写法归一化后命中（与界面标记不分裂）
+		{"deepseek.com", true},        // 精确命中
+		{"www.deepseek.com", true},    // 子域命中
+		{"api.deepseek.com", true},    // 子域命中
+		{"xabc.com", false},           // 只是后缀沾边，不是子域
+		{"evil-demo-llm.local", false},
+		{"127.0.0.1.evil.com", false}, // IP 后面接尾缀不覆盖
+		{"api.openai.com", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := isDomainAuthorized(c.host, authorized); got != c.want {
+			t.Errorf("isDomainAuthorized(%q) = %v, want %v", c.host, got, c.want)
+		}
+	}
+
+	// 空名单永不授权
+	if isDomainAuthorized("example.com", nil) {
+		t.Error("empty list should not authorize anything")
+	}
+
+	// *.example.com 条目归一化后覆盖子域（与 Console 口径一致）
+	if !isDomainAuthorized("api.example.com", []string{"*.example.com"}) {
+		t.Error("*.example.com entry should cover api.example.com")
+	}
+
+	// 名单侧条目大小写/空白不影响判定（parseConfig 归一化后的二次防御）
+	if !isDomainAuthorized("chat.example.com", []string{" Example.COM "}) {
+		t.Error("entry normalization should be applied at match time too")
+	}
+}
+
+func TestParseConfigAuthorizedDomains(t *testing.T) {
+	cfgJSON := `{
+		"mode": "monitoring",
+		"authorized_domains": ["*.Example.COM", " demo-llm.local ", "", ".", "127.0.0.1"],
+		"categories": [{"name": "saas_ai", "risk_level": "high", "domains": ["api.openai.com"]}]
+	}`
+	cfg := AiShadowDetectConfig{}
+	if err := parseConfig(gjson.Parse(cfgJSON), &cfg, nil); err != nil {
+		t.Fatalf("parseConfig error: %v", err)
+	}
+	want := []string{"example.com", "demo-llm.local", "127.0.0.1"}
+	if len(cfg.authorizedDomains) != len(want) {
+		t.Fatalf("authorizedDomains = %v, want %v", cfg.authorizedDomains, want)
+	}
+	for i, w := range want {
+		if cfg.authorizedDomains[i] != w {
+			t.Errorf("authorizedDomains[%d] = %q, want %q", i, cfg.authorizedDomains[i], w)
+		}
+	}
+}

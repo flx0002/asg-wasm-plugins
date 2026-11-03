@@ -99,8 +99,13 @@ type AiShadowDetectConfig struct {
 	aiRouteModels        []string // S1a：AI Route 的 model 头前缀集合（predicate=PRE）
 	aiRouteModelExacts   []string // S1a：AI Route 的 model 头精确集合（predicate=EQUAL）
 	authorizedProxyHosts []string // S1b：已登记代理域名（授权域名 ∩ ingress host）
-	routeHeader          string   // 取 model 的请求头，默认 x-higress-llm-model
-	consumerHeader       string   // key-auth 的授权标记头，默认 x-asg-consumer-ok
+	// 授权域名白名单（原始列表，含没有 Ingress 的主机/IP，如 127.0.0.1）。
+	// 由 Console 派生下发（authorized_domains）。命中即整体豁免：域名/路径/载荷
+	// 三个维度都不再判定——这就是「路径/字段白名单」的实现方式，不需要单独的
+	// 路径或字段白名单配置。key-auth 的准入判定不在这里做，不受影响。
+	authorizedDomains  []string
+	routeHeader        string // 取 model 的请求头，默认 x-higress-llm-model
+	consumerHeader     string // key-auth 的授权标记头，默认 x-asg-consumer-ok
 
 	// sai-b17: detect-events 上报。页面（「检测到的AI服务访问」/KPI/趋势）读的是
 	// ai_shadow_detect_event 表，只打 Prometheus 指标不会出现在页面上，故必须逐条上报。
@@ -174,6 +179,13 @@ func parseConfig(json gjson.Result, config *AiShadowDetectConfig, log log.Log) e
 	for _, h := range json.Get("authorized_proxy_hosts").Array() {
 		if v := strings.ToLower(strings.TrimSpace(h.String())); v != "" {
 			config.authorizedProxyHosts = append(config.authorizedProxyHosts, v)
+		}
+	}
+	// 授权域名白名单：与 Console 的匹配口径一致（精确或子域）。
+	// 下发的域名本身不带端口，解析时仅做防御性归一化并剔除空条目。
+	for _, d := range json.Get("authorized_domains").Array() {
+		if v := normalizeAuthorizedDomain(d.String()); v != "" {
+			config.authorizedDomains = append(config.authorizedDomains, v)
 		}
 	}
 	config.routeHeader = strings.TrimSpace(json.Get("route_header").String())
@@ -308,6 +320,15 @@ func decideRequestHeaders(ctx wrapper.HttpContext, config AiShadowDetectConfig, 
 	// 「绕道公网 AI + body 里写一个内部模型名」就会在 enforcement 下被放过。
 	s1, channelHint := matchedRegisteredChannel(config, host)
 	if s1 && isAuthorizedConsumer(config) {
+		return types.ActionContinue
+	}
+
+	// 授权域名白名单：命中即整体豁免——Stage 1/2/3 与「通道内未授权」上报都不再产生事件。
+	// 这就是「路径/字段白名单」的实现：路径与载荷是检测特征维度，不是独立的白名单维度，
+	// 域名一经授权（Console 授权域名），其路径/字段特征不再判定，与「已放行」语义一致。
+	// 匹配规则与 Console 的 isDomainAuthorized 一致（精确或子域）；key-auth 的准入判定
+	// 在 AUTHN 阶段独立进行，不受影响。
+	if isDomainAuthorized(host, config.authorizedDomains) {
 		return types.ActionContinue
 	}
 
@@ -636,6 +657,38 @@ func matchDomainWithResult(sni, host string, cat CategoryConfig) (bool, string) 
 		}
 	}
 	return false, ""
+}
+
+// normalizeAuthorizedDomain 归一化授权域名/主机名：去首尾空白、转小写、
+// 去 "*." 前缀、去前导与尾随 "."。空串表示无效条目。刻意不做 AiShadowServiceImpl
+// 归一化里的 "_"→"." 替换——那只为历史条目（chat_example_com）的「已授权」标记服务，
+// 一旦用于放行判定会把 a_b.com 过度匹配成 a.b.com（其 javadoc 明文告诫）。
+// 下发列表在 Console 侧已归一化，这里做幂等的二次防御。
+func normalizeAuthorizedDomain(domain string) string {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	d = strings.TrimPrefix(d, "*.")
+	d = strings.Trim(d, ".")
+	return d
+}
+
+// isDomainAuthorized 判断 host 是否被授权域名覆盖。匹配规则与 Console 的
+// isDomainAuthorized / isCoveredByAuthorizedDomain 一致：双方归一化后
+// 精确相等，或 host 以 "."+授权域名 结尾（子域覆盖，点边界）。
+func isDomainAuthorized(host string, authorizedDomains []string) bool {
+	normalized := normalizeAuthorizedDomain(host)
+	if normalized == "" {
+		return false
+	}
+	for _, authorized := range authorizedDomains {
+		a := normalizeAuthorizedDomain(authorized)
+		if a == "" {
+			continue
+		}
+		if normalized == a || strings.HasSuffix(normalized, "."+a) {
+			return true
+		}
+	}
+	return false
 }
 
 func (config *AiShadowDetectConfig) incrementCounter(metricName string, inc uint64) {
