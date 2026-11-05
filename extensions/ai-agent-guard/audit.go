@@ -20,6 +20,7 @@ const (
 	MaxFieldLength  = 512 // 单字段截断长度
 	MaxDetailLength = 256 // 事件详情截断长度
 	MaxEventsPerLog = 20  // 单条日志最大事件数
+	MaxHitContentLength = 512 // 命中原文截断长度
 	// MaxRequestBodyContentLength 请求正文记录最大长度（脱敏后截断）
 	MaxRequestBodyContentLength = 2048
 )
@@ -81,6 +82,15 @@ type AuditEvent struct {
 	Score    int    `json:"score"`
 	Detail   string `json:"detail"` // 已脱敏、截断
 	Direction string `json:"direction"` // 命中方向：request|response
+	HitContent  string `json:"hit_content"`
+	RuleName    string `json:"rule_name"`
+	RuleGroup   string `json:"rule_group"`
+	MatchMethod string `json:"match_method"`
+	MatchedText string `json:"matched_text"`
+	Reason      string `json:"reason"`
+	DetectMode  string `json:"detect_mode"`
+	Blocked     bool   `json:"blocked"`
+	TimestampMs int64  `json:"timestamp_ms"`
 }
 
 // writeAuditLog 写入审计日志到 ai_log 和 Redis
@@ -89,6 +99,10 @@ func writeAuditLog(ctx wrapper.HttpContext, cfg *config.AgentGuardConfig, rs *Re
 		return
 	}
 	rs.AuditWritten = true
+
+	// 写审计前统一读一次 ai_log：覆盖响应体阶段才产生的命中，并把
+	// ai-prompt-guard 明确传递的 blocked 落到 rs.Blocked（不再从 403 反推）。
+	mergeSecurityEventsFromAILog(rs)
 
 	entry := buildAuditEntry(cfg, rs)
 
@@ -273,7 +287,7 @@ func deduplicateSecurityEvents(events []SecurityEvent) []SecurityEvent {
 	seen := make(map[string]struct{}, len(events))
 	result := make([]SecurityEvent, 0, len(events))
 	for _, event := range events {
-		key := event.Type + "\x00" + event.Source + "\x00" + event.Severity + "\x00" + event.Detail + "\x00" + event.Direction
+		key := securityEventKey(event)
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -337,6 +351,15 @@ func buildAuditEntry(cfg *config.AgentGuardConfig, rs *RequestState) AuditLogEnt
 			Score:    e.Score,
 			Detail:   truncateAndSanitize(e.Detail, MaxDetailLength),
 			Direction: e.Direction,
+			HitContent:  truncateRunesAndSanitize(e.HitContent, MaxHitContentLength),
+			RuleName:    truncateRunes(e.RuleName, MaxFieldLength),
+			RuleGroup:   truncateRunes(e.RuleGroup, MaxFieldLength),
+			MatchMethod: truncateRunes(e.MatchMethod, MaxFieldLength),
+			MatchedText: truncateRunes(e.MatchedText, MaxDetailLength),
+			Reason:      truncateRunesAndSanitize(e.Reason, MaxFieldLength),
+			DetectMode:  e.DetectMode,
+			Blocked:     e.Blocked,
+			TimestampMs: e.TimestampMs,
 		})
 	}
 
@@ -405,6 +428,30 @@ func truncateAndSanitize(s string, maxLen int) string {
 	}
 
 	return sanitized
+}
+
+// truncateRunesAndSanitize 按 rune 截断，避免把中文等 UTF-8 字符切成半个字符。
+// 事件级新增字段含用户输入原文，必须走这里而不是按字节截断的 truncateAndSanitize。
+func truncateRunesAndSanitize(s string, maxRunes int) string {
+	if len(s) == 0 {
+		return ""
+	}
+	s = sanitizePII(s)
+	r := []rune(s)
+	if len(r) > maxRunes {
+		return string(r[:maxRunes]) + "..."
+	}
+	return s
+}
+
+// truncateRunes 只按 rune 截断，不脱敏：规则名/命中片段是配置态元数据，
+// sanitizePII 会把恰好 15 或 18 字符的普通词误判为身份证号并打码。
+func truncateRunes(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "..."
 }
 
 // sanitizePII 简单 PII 脱敏

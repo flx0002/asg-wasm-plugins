@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
@@ -28,6 +29,17 @@ import (
 
 const (
 	pluginName = "ai-prompt-guard"
+	// prompt_guard_event 写入 wasm.ai_log 一级 filter state（per-request 共享），
+	// 供 ai-agent-guard 读取；两级路径 security_events 跨 VM 不可见。
+	PromptGuardEventKey = "prompt_guard_event"
+
+	// 写入 ai_log 的事件体必须有上界：access log 模板会把整个 wasm.ai_log
+	// 过滤状态打进单行 JSON，超长行会被采集器静默丢弃。
+	maxHitContentRunes  = 512
+	maxMatchedTextRunes = 128
+	maxReasonRunes      = 512
+	maxEmittedEvents    = 20
+	maxAIlogEventBytes  = 8192
 )
 
 func main() {}
@@ -355,14 +367,15 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PromptGuardConfig, body [
 			continue
 		}
 		hit, info := detectContent(content, config)
+		info.content = content
 		if hit {
 			if config.DetectMode == "monitor" {
 				log.Infof("Malicious prompt detected (group=%s method=%s) in monitor mode, request passed", info.group, info.method)
-				appendSecurityEvent(eventFor(info, "request"))
+				emitSecurityEvent(ctx, eventFor(info, "request", config.DetectMode))
 				continue
 			}
 			log.Infof("Malicious prompt detected (group=%s method=%s), blocking request", info.group, info.method)
-			appendSecurityEvent(eventFor(info, "request"))
+			emitSecurityEvent(ctx, eventFor(info, "request", config.DetectMode))
 			sendDenyResponse(config.DenyCode, config.DenyMessage)
 			return types.ActionContinue
 		}
@@ -372,10 +385,13 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PromptGuardConfig, body [
 }
 
 type hitInfo struct {
-	group  string
-	detail string
-	method string // "plain", decode method, or "keyword"
-	kind   string // "prompt_injection" or "content_violation"
+	group       string
+	detail      string
+	method      string // "plain", decode method, or "keyword"
+	kind        string // "prompt_injection" or "content_violation"
+	content     string // 被检测的原文（由回调填入）
+	matchedText string // 实际命中的关键词 / 正则片段
+	ruleGroup   string // denyRules / keywordRules / normalized_deny
 }
 
 // detectContent checks text against allow (bypass), deny patterns/rules,
@@ -392,7 +408,7 @@ func detectContent(text string, config PromptGuardConfig) (bool, hitInfo) {
 			if name == "" {
 				name = "deny_pattern"
 			}
-			return true, hitInfo{group: name, detail: "Detected prompt injection / jailbreak pattern: " + name, method: "plain", kind: "prompt_injection"}
+			return true, hitInfo{group: name, detail: "Detected prompt injection / jailbreak pattern: " + name, method: "plain", kind: "prompt_injection", matchedText: rule.re.FindString(text), ruleGroup: "denyRules"}
 		}
 	}
 	if config.EnableNormalization {
@@ -406,7 +422,7 @@ func detectContent(text string, config PromptGuardConfig) (bool, hitInfo) {
 					if name == "" {
 						name = "deny_pattern"
 					}
-					return true, hitInfo{group: name, detail: "Detected prompt injection / jailbreak pattern: " + name + " (decoded via " + c.Method + ")", method: c.Method, kind: "prompt_injection"}
+					return true, hitInfo{group: name, detail: "Detected prompt injection / jailbreak pattern: " + name + " (decoded via " + c.Method + ")", method: c.Method, kind: "prompt_injection", matchedText: rule.re.FindString(c.Text), ruleGroup: "normalized_deny"}
 				}
 			}
 		}
@@ -416,32 +432,91 @@ func detectContent(text string, config PromptGuardConfig) (bool, hitInfo) {
 	for _, g := range config.compiledKeywordGroups {
 		for _, kw := range g.keywords {
 			if strings.Contains(lower, kw) {
-				return true, hitInfo{group: g.name, detail: "GB/T 45654 Appendix A risk hit [" + g.name + "] keyword: " + kw, method: "keyword", kind: "content_violation"}
+				return true, hitInfo{group: g.name, detail: "GB/T 45654 Appendix A risk hit [" + g.name + "] keyword: " + kw, method: "keyword", kind: "content_violation", matchedText: kw, ruleGroup: "keywordRules"}
 			}
 		}
 		for _, re := range g.patterns {
 			if re.MatchString(text) {
-				return true, hitInfo{group: g.name, detail: "GB/T 45654 Appendix A risk hit [" + g.name + "] variant pattern", method: "regex", kind: "content_violation"}
+				return true, hitInfo{group: g.name, detail: "GB/T 45654 Appendix A risk hit [" + g.name + "] variant pattern", method: "regex", kind: "content_violation", matchedText: re.FindString(text), ruleGroup: "keywordRules"}
 			}
 		}
 	}
 	return false, hitInfo{}
 }
 
-func eventFor(info hitInfo, direction string) SecurityEvent {
+// boundedText 按 rune 截断，避免把中文截成半个字。
+func boundedText(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "…"
+}
+
+// boundedExcerpt 以命中位置为中心截取原文：既保留「具体是哪段内容触发」，
+// 又不会把数百 KB 的完整上下文写进 ai_log / access log。
+func boundedExcerpt(content, matched string, maxRunes int) string {
+	r := []rune(content)
+	if len(r) <= maxRunes {
+		return content
+	}
+	start := 0
+	if matched != "" {
+		if idx := strings.Index(content, matched); idx >= 0 {
+			start = len([]rune(content[:idx])) - maxRunes/2
+			if start < 0 {
+				start = 0
+			}
+		}
+	}
+	if start+maxRunes > len(r) {
+		start = len(r) - maxRunes
+	}
+	prefix, suffix := "", ""
+	if start > 0 {
+		prefix = "…"
+	}
+	if start+maxRunes < len(r) {
+		suffix = "…"
+	}
+	return prefix + string(r[start:start+maxRunes]) + suffix
+}
+
+func eventFor(info hitInfo, direction string, mode string) SecurityEvent {
 	severity := "high"
 	score := 80
 	if info.kind == "content_violation" {
 		severity = "high"
 		score = 90
 	}
+	blocked := mode == "deny"
+	matchedText := boundedText(info.matchedText, maxMatchedTextRunes)
+	reason := "命中规则[" + info.group + "]，匹配方式=" + info.method
+	if matchedText != "" {
+		reason += "，命中片段=" + matchedText
+	}
+	if blocked {
+		reason += "；拦截模式已拦截请求"
+	} else {
+		reason += "；检测模式仅告警并放行"
+	}
+	reason = boundedText(reason, maxReasonRunes)
 	return SecurityEvent{
-		Type:      info.kind,
-		Severity:  severity,
-		Source:    pluginName,
-		Score:     score,
-		Detail:    info.detail,
-		Direction: direction,
+		Type:        info.kind,
+		Severity:    severity,
+		Source:      pluginName,
+		Score:       score,
+		Detail:      info.detail,
+		Direction:   direction,
+		HitContent:  boundedExcerpt(info.content, info.matchedText, maxHitContentRunes),
+		RuleName:    info.group,
+		RuleGroup:   info.ruleGroup,
+		MatchMethod: info.method,
+		MatchedText: matchedText,
+		Reason:      reason,
+		DetectMode:  mode,
+		Blocked:     blocked,
+		TimestampMs: time.Now().UnixMilli(),
 	}
 }
 
@@ -460,14 +535,15 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PromptGuardConfig, body 
 	}
 
 	hit, info := detectContent(text, config)
+	info.content = text
 	if hit {
 		if config.DetectMode == "monitor" {
 			log.Infof("Violation detected in model output (group=%s) in monitor mode, response passed", info.group)
-			appendSecurityEvent(eventFor(info, "response"))
+			emitSecurityEvent(ctx, eventFor(info, "response", config.DetectMode))
 			return types.ActionContinue
 		}
 		log.Infof("Violation detected in model output (group=%s method=%s), blocking response", info.group, info.method)
-		appendSecurityEvent(eventFor(info, "response"))
+		emitSecurityEvent(ctx, eventFor(info, "response", config.DetectMode))
 		sendDenyResponse(config.DenyCode, config.DenyMessage)
 		return types.ActionContinue
 	}
@@ -592,19 +668,35 @@ func buildErrorResponse(message string) string {
 
 // SecurityEvent 安全事件（与 ai-agent-guard 的 SecurityEvent 结构对齐）
 type SecurityEvent struct {
-	Type      string `json:"type"`
-	Severity  string `json:"severity"`
-	Source    string `json:"source"`
-	Score     int    `json:"score"`
-	Detail    string `json:"detail"`
-	Direction string `json:"direction"` // "request" = 命中于请求体（用户输入侧）；"response" = 命中于响应体（模型输出侧）
+	Type        string `json:"type"`
+	Severity    string `json:"severity"`
+	Source      string `json:"source"`
+	Score       int    `json:"score"`
+	Detail      string `json:"detail"`
+	Direction   string `json:"direction"` // "request" = 命中于请求体；"response" = 命中于响应体
+	HitContent  string `json:"hit_content"`
+	RuleName    string `json:"rule_name"`
+	RuleGroup   string `json:"rule_group"`
+	MatchMethod string `json:"match_method"`
+	MatchedText string `json:"matched_text"`
+	Reason      string `json:"reason"`
+	DetectMode  string `json:"detect_mode"`
+	Blocked     bool   `json:"blocked"`
+	TimestampMs int64  `json:"timestamp_ms"`
 }
 
-// appendSecurityEvent 向 Dynamic Metadata 追加安全事件，供 ai-agent-guard 收集并记录审计日志
-func appendSecurityEvent(event SecurityEvent) {
+// emitSecurityEvent 把命中事件写入 wasm.ai_log 一级 filter state。
+// 两级路径 security_events 属于插件私有 VM，ai-agent-guard 读不到；ai_log 是
+// per-request 共享状态，WriteUserAttributeToLogWithKey 会先读回已有 key 再 merge，
+// 因此不会覆盖其它插件写入的 agent_guard_audit / api 等字段。
+func emitSecurityEvent(ctx wrapper.HttpContext, event SecurityEvent) {
 	var events []SecurityEvent
-	if existing, err := proxywasm.GetProperty([]string{"security_events", "events"}); err == nil && len(existing) > 0 {
-		_ = json.Unmarshal(existing, &events)
+	if existing, ok := ctx.GetUserAttribute(PromptGuardEventKey).(string); ok && existing != "" {
+		_ = json.Unmarshal([]byte(existing), &events)
+	}
+	if len(events) >= maxEmittedEvents {
+		log.Warnf("prompt guard events exceed %d, drop new hit", maxEmittedEvents)
+		return
 	}
 	events = append(events, event)
 	data, err := json.Marshal(events)
@@ -612,7 +704,18 @@ func appendSecurityEvent(event SecurityEvent) {
 		log.Warnf("marshal security events failed: %v", err)
 		return
 	}
-	if err := proxywasm.SetProperty([]string{"security_events", "events"}, data); err != nil {
-		log.Warnf("set security_events metadata failed: %v", err)
+	// 事件数组整体也要有上界：保留最新命中、丢弃最旧，防止多条大命中叠加
+	// 把 wasm.ai_log（以及由它生成的单行 access log）撑到几十 KB。
+	for len(events) > 1 && len(data) > maxAIlogEventBytes {
+		events = events[1:]
+		data, err = json.Marshal(events)
+		if err != nil {
+			log.Warnf("marshal security events failed: %v", err)
+			return
+		}
+	}
+	ctx.SetUserAttribute(PromptGuardEventKey, string(data))
+	if err := ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey); err != nil {
+		log.Warnf("write %s to ai_log failed: %v", PromptGuardEventKey, err)
 	}
 }

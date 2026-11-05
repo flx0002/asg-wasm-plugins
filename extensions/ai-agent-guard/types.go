@@ -76,7 +76,7 @@ type SessionMeta struct {
 	CreatedAt      int64 `json:"created_at"`       // Unix 时间戳（秒）
 }
 
-// SecurityEvent 安全事件（由安全插件通过 Dynamic Metadata 或 Redis 写入）
+// SecurityEvent 安全事件（由 ai-prompt-guard 经 ai_log 写入，或本插件自身产生）
 type SecurityEvent struct {
 	Type       string `json:"type"`        // 事件类型：prompt_injection, content_violation, pii_leak 等
 	Severity   string `json:"severity"`    // 严重程度：low, medium, high
@@ -85,4 +85,13 @@ type SecurityEvent struct {
 	Detail     string `json:"detail"`      // 事件详情（已脱敏）
 	ToolName   string `json:"tool_name"`   // 相关工具名（可选）
 	Direction  string `json:"direction"`   // 命中方向：request=用户输入侧，response=模型输出侧
+	HitContent  string `json:"hit_content"`
+	RuleName    string `json:"rule_name"`
+	RuleGroup   string `json:"rule_group"`
+	MatchMethod string `json:"match_method"`
+	MatchedText string `json:"matched_text"`
+	Reason      string `json:"reason"`
+	DetectMode  string `json:"detect_mode"`
+	Blocked     bool   `json:"blocked"`
+	TimestampMs int64  `json:"timestamp_ms"`
 }

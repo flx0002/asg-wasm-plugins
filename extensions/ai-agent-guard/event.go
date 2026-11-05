@@ -7,54 +7,85 @@ import (
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/wasm-go/pkg/log"
+	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/tidwall/resp"
 )
 
-// collectSecurityEvents 收集安全事件
-// 首选方案：从 Dynamic Metadata 读取（零网络开销）
-// 保底方案：从 Redis Event Key 读取
+const PromptGuardEventKey = "prompt_guard_event"
+
+// collectSecurityEvents 只从 wasm.ai_log 一级 filter state 读取 ai-prompt-guard
+// 写入的真实命中事件。两级路径 security_events 属于插件私有 VM，跨插件不可见；
+// 任何从 HTTP 状态码反推事件的做法都会把其它插件的 403 误报成提示注入，已移除。
 func collectSecurityEvents(rs *RequestState) []SecurityEvent {
-	// 首选：Dynamic Metadata
-	events := collectEventsFromMetadata()
-	if len(events) > 0 {
-		return events
-	}
-
-	// 保底：Redis 事件总线
-	events = collectEventsFromRedis(rs)
-	return events
+	return collectEventsFromAILog()
 }
 
-// collectEventsFromMetadata 从 Dynamic Metadata 读取安全事件
-func collectEventsFromMetadata() []SecurityEvent {
-	data, err := proxywasm.GetProperty([]string{MetadataNamespaceSecurityEvt, "events"})
-	if err != nil || len(data) == 0 {
-		log.Warnf("collectEventsFromMetadata: no events in metadata, err=%v, data_len=%d", err, len(data))
+// collectEventsFromAILog 解码 ai_log（marshalStr 产物是去掉外层引号的 JSON 字符串
+// 字面量内容），取出 prompt_guard_event。该值由 ai-prompt-guard 以 JSON 字符串写入，
+// 兼容直接以数组写入的历史形态。
+func collectEventsFromAILog() []SecurityEvent {
+	raw, err := proxywasm.GetProperty([]string{wrapper.AILogKey})
+	if err != nil || len(raw) == 0 {
 		return nil
 	}
-
+	var jsonStr string
+	if err := json.Unmarshal([]byte(`"`+string(raw)+`"`), &jsonStr); err != nil {
+		jsonStr = string(raw)
+	}
+	var attr map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(jsonStr), &attr); err != nil {
+		log.Warnf("collectEventsFromAILog: unmarshal ai_log failed: %v", err)
+		return nil
+	}
+	v, ok := attr[PromptGuardEventKey]
+	if !ok || len(v) == 0 {
+		return nil
+	}
+	var encoded string
+	if json.Unmarshal(v, &encoded) == nil {
+		v = []byte(encoded)
+	}
 	var events []SecurityEvent
-	if err := json.Unmarshal(data, &events); err != nil {
-		log.Warnf("unmarshal security events from metadata failed: %v", err)
+	if err := json.Unmarshal(v, &events); err != nil {
+		log.Warnf("collectEventsFromAILog: unmarshal prompt_guard_event failed: %v", err)
 		return nil
 	}
-
-	log.Debugf("collected %d security events from dynamic metadata", len(events))
 	return events
 }
 
-// collectEventsFromRedis 从 Redis 事件总线读取安全事件（保底方案）
-func collectEventsFromRedis(rs *RequestState) []SecurityEvent {
-	// 此函数在响应头阶段调用，Redis 操作是异步的
-	// 但在响应头阶段我们需要同步获取事件，因此这里使用空实现
-	// 实际的 Redis 事件收集应在请求阶段通过异步方式预加载
-	//
-	// 注意：如果 Dynamic Metadata 方案不可用，安全插件会通过 Redis RPUSH 写入事件
-	// ai-agent-guard 需要在请求阶段就发起异步 LRANGE 读取，并在响应阶段使用缓存结果
-	//
-	// 当前实现：如果 Dynamic Metadata 失败，返回空事件列表
-	// 后续可通过在 RequestState 中缓存异步读取结果来优化
-	return nil
+// securityEventKey 供写审计前合并与 buildAuditEntry 输出共用。
+// 必须带上命中原文与时间戳：同一请求里多条 message 命中同一规则时，
+// 旧键会把它们折叠成一条，详情里就看不到各自的输入。
+func securityEventKey(e SecurityEvent) string {
+	return fmt.Sprintf("%d|%s|%s|%s|%s|%s|%s", e.TimestampMs, e.Type, e.RuleName,
+		e.MatchedText, e.Direction, e.HitContent, e.Detail)
+}
+
+// mergeSecurityEventsFromAILog 在写审计前统一增量合并一次，覆盖响应体阶段才产生的
+// 命中（响应体晚于 onHttpResponseHeaders 的首次收集）。同一事件按
+// timestamp_ms + rule_name + matched_text + direction 去重，避免重复计数。
+// blocked 只取插件按 detectMode 明确传递的值，不再从 HTTP 状态码反推。
+func mergeSecurityEventsFromAILog(rs *RequestState) {
+	if rs == nil {
+		return
+	}
+	keyOf := securityEventKey
+	for _, e := range collectEventsFromAILog() {
+		key := keyOf(e)
+		dup := false
+		for _, existing := range rs.Events {
+			if keyOf(existing) == key {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			rs.Events = append(rs.Events, e)
+		}
+		if e.Blocked {
+			rs.Blocked = true
+		}
+	}
 }
 
 // collectEventsFromRedisAsync 异步从 Redis 读取安全事件（在请求阶段调用）

@@ -437,17 +437,10 @@ func captureTokenUsageFromBody(rs *RequestState, body []byte) {
 	}
 }
 
-// inferSecurityEventsFromResponse 根据响应状态码和响应头推断安全事件
-// 由于 Wasm 插件运行在独立 VM 中，Dynamic Metadata 不跨插件共享，
-// ai-prompt-guard/ai-pii-guard 写入的 security_events metadata 无法被 ai-agent-guard 读取。
-// 此函数通过检查响应状态码和响应头来推断安全事件：
-// - 403 且非 ai-agent-guard 自身拦截 → 推断为 prompt_injection（由 ai-prompt-guard 拦截）
-// - x-pii-detected 响应头存在 → 推断为 pii_leak（由 ai-pii-guard 检测并脱敏）
-// 注意：PII 检测(200脱敏通过)和提示注入检测(403拦截)可同时存在于同一请求
+// inferSecurityEventsFromResponse 只处理 ai-pii-guard 通过响应头传递的 PII 事件。
+// 提示注入事件一律来自 ai-prompt-guard 写入 ai_log 的真实命中；过去"403 即
+// prompt_injection"的反推会把影子AI / key-auth / 上游的 403 全部误报，已删除。
 func inferSecurityEventsFromResponse(rs *RequestState) {
-	// 记录推断前的事件数量；若来自 Dynamic Metadata，后续不再推断 inject
-	preExistingCount := len(rs.Events)
-
 	// === PII 检测推断（通过 ai-pii-guard 设置的 x-pii-detected 响应头） ===
 	if piiHeader, err := proxywasm.GetHttpResponseHeader("x-pii-detected"); err == nil && piiHeader != "" {
 		if !hasEventType(rs.Events, "pii_leak") {
@@ -462,44 +455,6 @@ func inferSecurityEventsFromResponse(rs *RequestState) {
 			log.Debugf("inferSecurityEventsFromResponse: inferred pii_leak event from x-pii-detected header: %s", piiHeader)
 		}
 	}
-
-	// === 提示注入推断（通过响应状态码 403） ===
-	// 若事件已在 onHttpResponseHeaders 中通过 Dynamic Metadata 收集到，跳过推断避免覆盖
-	if preExistingCount > 0 {
-		return
-	}
-	// 如果是 ai-agent-guard 自身拦截的（rs.Blocked=true），不推断
-	if rs.Blocked {
-		return
-	}
-
-	// 尝试获取响应状态码
-	statusCode := rs.ResponseStatus
-	if statusCode == 0 {
-		if statusStr, err := proxywasm.GetHttpResponseHeader(":status"); err == nil && statusStr != "" {
-			if statusStr == "403" {
-				statusCode = 403
-			}
-		}
-	}
-
-	if statusCode != 403 {
-		return
-	}
-
-	// 403 且非自身拦截 → 推断为 prompt_injection（由 ai-prompt-guard 拦截）
-	rs.Events = append(rs.Events, SecurityEvent{
-		Type:     "prompt_injection",
-		Severity: "high",
-		Source:   "ai-prompt-guard",
-		Score:    80,
-		Detail:   "Detected prompt injection / jailbreak pattern in user message",
-		Direction: "request",
-	})
-	// 更新拦截标记
-	rs.Blocked = true
-	rs.ResponseStatus = 403
-	log.Warnf("inferSecurityEventsFromResponse: inferred prompt_injection event")
 }
 
 // hasEventType 检查事件列表中是否已包含指定类型的事件（避免重复添加）
@@ -603,8 +558,8 @@ func sendBlockResponse(ctx wrapper.HttpContext, cfg *config.AgentGuardConfig, st
 	if ok && rs != nil {
 		rs.Blocked = true
 		rs.ResponseStatus = statusCode
-		// 尝试读取安全插件已写入的事件
-		rs.Events = collectSecurityEvents(rs)
+		// 增量合并真实命中事件，不覆盖本插件此前已收集的 PII 等事件
+		mergeSecurityEventsFromAILog(rs)
 		writeAuditLog(ctx, cfg, rs)
 	}
 
