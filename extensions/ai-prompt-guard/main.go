@@ -369,8 +369,16 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PromptGuardConfig, body [
 		hit, info := detectContent(content, config)
 		info.content = content
 		if hit {
+			if info.kind == "prompt_injection" {
+				info.confidence, info.evidence = assessInjection(content, info.matchedText, msg.Get("role").String())
+			}
 			if config.DetectMode == "monitor" {
 				log.Infof("Malicious prompt detected (group=%s method=%s) in monitor mode, request passed", info.group, info.method)
+				emitSecurityEvent(ctx, eventFor(info, "request", config.DetectMode))
+				continue
+			}
+			if info.confidence == confidenceLow {
+				log.Infof("Injection rule hit downgraded to alert (group=%s evidence=%s), request passed", info.group, info.evidence)
 				emitSecurityEvent(ctx, eventFor(info, "request", config.DetectMode))
 				continue
 			}
@@ -392,6 +400,8 @@ type hitInfo struct {
 	content     string // 被检测的原文（由回调填入）
 	matchedText string // 实际命中的关键词 / 正则片段
 	ruleGroup   string // denyRules / keywordRules / normalized_deny
+	confidence  string // prompt_injection 命中经上下文复判后的置信度："" / high / low
+	evidence    string // 复判依据，写进事件 reason 供审计详情阅读
 }
 
 // detectContent checks text against allow (bypass), deny patterns/rules,
@@ -444,6 +454,101 @@ func detectContent(text string, config PromptGuardConfig) (bool, hitInfo) {
 	return false, hitInfo{}
 }
 
+// 注入类规则命中只作为「候选证据」：规则本身无法区分「攻击指令」与
+// 「安全规范/技术文档里对注入术语的引用、元讨论」。下面三组词表用于在命中点
+// 附近做一次廉价复判，窗口有界，避免数百 KB 上下文带来额外开销。
+// 注意：这是降低误报的启发式，不是安全边界；deny 模式仍需配合其它防线。
+const (
+	injectionContextRunes = 96
+	confidenceHigh        = "high"
+	confidenceLow         = "low"
+)
+
+var (
+	// 指令性动词：与 injectionTargetWords 共现才构成强意图。
+	injectionIntentWords = []string{
+		"ignore", "forget", "disregard", "override", "bypass", "reveal",
+		"print", "dump", "leak", "disclose", "output", "repeat",
+		"忽略", "忘记", "无视", "绕过", "覆写", "泄露", "输出", "打印", "重复",
+	}
+	injectionTargetWords = []string{
+		"instructions", "instruction", "prompt", "rules", "system", "previous", "above",
+		"指令", "提示词", "规则", "系统", "上文",
+	}
+	// 只保留显式的文档/教学/元讨论标记：通用否定词（不要/禁止）与弱连接词
+	// （例如/比如/如下）会被攻击者直接拼在载荷前，放进这里等于提供一行绕过。
+	injectionMetaWords = []string{
+		"示例", "术语", "称为", "定义", "解释", "文档", "规范", "说明", "引用",
+		"上下文数据", "框架文本", "带偏", "误报", "命中", "规则名", "教学",
+		"不是语言示范", "这类", "检测方法", "什么是", "是什么", "什么意思",
+		"for example", "such as", "e.g.", "refers to", "is called", "definition",
+		"what is", "what are", "meaning of",
+	}
+)
+
+func containsAnyWord(s string, words []string) bool {
+	for _, w := range words {
+		if strings.Contains(s, w) {
+			return true
+		}
+	}
+	return false
+}
+
+// contextWindow 以命中位置为中心取有限窗口（按 rune，中文不会被截半）。
+// 只把命中点附近的字节片段转成 []rune，避免数百 KB 上下文被整体转换。
+func contextWindow(content, matched string, width int) string {
+	idx := 0
+	if matched != "" {
+		if i := strings.Index(content, matched); i >= 0 {
+			idx = i
+		}
+	}
+	byteWidth := width * 4 // UTF-8 单字符最多 4 字节，足够覆盖 width 个 rune
+	start := idx - byteWidth
+	if start < 0 {
+		start = 0
+	}
+	for start > 0 && content[start]&0xC0 == 0x80 {
+		start--
+	}
+	end := idx + byteWidth
+	if end > len(content) {
+		end = len(content)
+	}
+	r := []rune(content[start:end])
+	center := len([]rune(content[start:idx]))
+	lo := center - width
+	if lo < 0 {
+		lo = 0
+	}
+	hi := center + width
+	if hi > len(r) {
+		hi = len(r)
+	}
+	return string(r[lo:hi])
+}
+
+// assessInjection 把注入类规则命中转成置信度。low 只记录告警、不拦截。
+// 所有 role 照常检测以保留可见性；system/developer/assistant 按应用侧文本对待，
+// 只有出现指令性动词与目标词时才升为 high，避免「载荷塞进 system」被静默放过。
+func assessInjection(content, matched, role string) (string, string) {
+	lower := strings.ToLower(contextWindow(content, matched, injectionContextRunes))
+	intent := containsAnyWord(lower, injectionIntentWords) && containsAnyWord(lower, injectionTargetWords)
+	meta := containsAnyWord(lower, injectionMetaWords)
+	trusted := role == "system" || role == "developer" || role == "assistant"
+	switch {
+	case meta:
+		return confidenceLow, "命中处为引用/元讨论语境"
+	case trusted && !intent:
+		return confidenceLow, "应用侧文本且无指令性动词"
+	case intent:
+		return confidenceHigh, "命中处含指令性动词与目标词"
+	default:
+		return confidenceHigh, "命中处无引用语境"
+	}
+}
+
 // boundedText 按 rune 截断，避免把中文截成半个字。
 func boundedText(s string, maxRunes int) string {
 	r := []rune(s)
@@ -489,7 +594,12 @@ func eventFor(info hitInfo, direction string, mode string) SecurityEvent {
 		severity = "high"
 		score = 90
 	}
-	blocked := mode == "deny"
+	downgraded := info.kind == "prompt_injection" && info.confidence == confidenceLow
+	if downgraded {
+		severity = "low"
+		score = 30
+	}
+	blocked := mode == "deny" && !downgraded
 	matchedText := boundedText(info.matchedText, maxMatchedTextRunes)
 	reason := "命中规则[" + info.group + "]，匹配方式=" + info.method
 	if matchedText != "" {
@@ -497,6 +607,8 @@ func eventFor(info hitInfo, direction string, mode string) SecurityEvent {
 	}
 	if blocked {
 		reason += "；拦截模式已拦截请求"
+	} else if downgraded {
+		reason += "；上下文复判=" + info.evidence + "，置信度不足，仅记录并放行"
 	} else {
 		reason += "；检测模式仅告警并放行"
 	}
@@ -537,8 +649,11 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PromptGuardConfig, body 
 	hit, info := detectContent(text, config)
 	info.content = text
 	if hit {
-		if config.DetectMode == "monitor" {
-			log.Infof("Violation detected in model output (group=%s) in monitor mode, response passed", info.group)
+		if info.kind == "prompt_injection" {
+			info.confidence, info.evidence = assessInjection(text, info.matchedText, "assistant")
+		}
+		if config.DetectMode == "monitor" || info.confidence == confidenceLow {
+			log.Infof("Violation detected in model output (group=%s confidence=%s), response passed", info.group, info.confidence)
 			emitSecurityEvent(ctx, eventFor(info, "response", config.DetectMode))
 			return types.ActionContinue
 		}
