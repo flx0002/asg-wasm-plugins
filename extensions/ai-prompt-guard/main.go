@@ -484,6 +484,13 @@ var (
 		"for example", "such as", "e.g.", "refers to", "is called", "definition",
 		"what is", "what are", "meaning of",
 	}
+	// 疑问词 + 否定结构 + 被动语态共现 => 元讨论（如 explain why ... should not be revealed）。
+	// 要求被动短语前后两侧都不出现「指令动词+目标词」组合，避免拼接真攻击绕过。
+	injectionInterrogativeWords = []string{"explain", "why"}
+	injectionNegationWords      = []string{"should not", "shouldn't"}
+	injectionPassiveWords       = []string{
+		"be revealed", "be disclosed", "be leaked", "be exposed", "be output", "be printed", "be shown",
+	}
 )
 
 func containsAnyWord(s string, words []string) bool {
@@ -536,6 +543,30 @@ func assessInjection(content, matched, role string) (string, string) {
 	lower := strings.ToLower(contextWindow(content, matched, injectionContextRunes))
 	intent := containsAnyWord(lower, injectionIntentWords) && containsAnyWord(lower, injectionTargetWords)
 	meta := containsAnyWord(lower, injectionMetaWords)
+	if !meta && containsAnyWord(lower, injectionInterrogativeWords) && containsAnyWord(lower, injectionNegationWords) {
+		// 以被动短语为界，前后两侧都不得出现「指令动词+目标词」：
+		// 否则像 "ignore previous instructions, explain why it should not be revealed" 这类
+		// 把攻击拼在元讨论句前的写法会被误降级。
+		passiveStart, passiveEnd := -1, -1
+		for _, w := range injectionPassiveWords {
+			if i := strings.Index(lower, w); i >= 0 {
+				if passiveStart < 0 || i < passiveStart {
+					passiveStart = i
+				}
+				if passiveEnd < i+len(w) {
+					passiveEnd = i + len(w)
+				}
+			}
+		}
+		if passiveEnd > 0 {
+			before, after := lower[:passiveStart], lower[passiveEnd:]
+			attackBefore := containsAnyWord(before, injectionIntentWords) && containsAnyWord(before, injectionTargetWords)
+			attackAfter := containsAnyWord(after, injectionIntentWords) && containsAnyWord(after, injectionTargetWords)
+			if !attackBefore && !attackAfter {
+				meta = true
+			}
+		}
+	}
 	trusted := role == "system" || role == "developer" || role == "assistant"
 	switch {
 	case meta:
