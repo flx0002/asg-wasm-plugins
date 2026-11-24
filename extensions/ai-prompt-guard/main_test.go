@@ -370,12 +370,50 @@ func TestExtractResponseText(t *testing.T) {
 }
 
 func TestAppendAdvice(t *testing.T) {
-	body := []byte(`{"choices":[{"message":{"role":"assistant","content":"建议每日服用两片"}}]}`)
-	out := appendAdvice(body, "本内容为AI生成，不能替代专业医疗建议")
-	require.NotNil(t, out)
-	require.Contains(t, string(out), "安全提示")
-	require.True(t, gjson.ValidBytes(out))
-	require.Contains(t, gjson.GetBytes(out, "choices.0.message.content").String(), "本内容为AI生成")
+	advice := "本内容为AI生成，不能替代专业医疗建议"
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{
+			name: "literal UTF-8 content",
+			body: []byte(`{"choices":[{"message":{"role":"assistant","content":"建议每日服用两片"}}]}`),
+		},
+		{
+			name: "escaped unicode content",
+			body: []byte(`{"choices":[{"message":{"role":"assistant","content":"\u5173\u4e8e\u7528\u836f\u5242\u91cf\uff0c\u8bf7\u9075\u533b\u5631"}}],"model":"m"}`),
+		},
+		{
+			name: "content with quotes and angle brackets",
+			body: []byte(`{"choices":[{"message":{"role":"assistant","content":"\u5173\u4e8e <b>\"用法\"</b> & \u5242\u91cf"}}]}`),
+		},
+		{
+			name: "multiple choices",
+			body: []byte(`{"choices":[{"message":{"content":"\u7528\u836f\u5242\u91cf"}},{"message":{"content":"\u7528\u836f\u5242\u91cf"}}]}`),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out := appendAdvice(tc.body, advice)
+			require.NotNil(t, out)
+			require.True(t, gjson.ValidBytes(out))
+			got := gjson.GetBytes(out, "choices.0.message.content").String()
+			require.Contains(t, got, advice)
+			require.Contains(t, got, "安全提示")
+			// 其他字段保持不变
+			if gjson.GetBytes(tc.body, "model").Exists() {
+				require.Equal(t, gjson.GetBytes(tc.body, "model").String(), gjson.GetBytes(out, "model").String())
+			}
+			// 只有第一个 choice 被注入
+			if tc.name == "multiple choices" {
+				require.Equal(t, "\u7528\u836f\u5242\u91cf", gjson.GetBytes(out, "choices.1.message.content").String())
+			}
+		})
+	}
+
+	// 结构无法识别时返回 nil
+	require.Nil(t, appendAdvice([]byte(`{"foo":"bar"}`), advice))
+	require.Nil(t, appendAdvice([]byte(`not json`), advice))
 }
 
 func TestMonitorAndAdvisoryParse(t *testing.T) {

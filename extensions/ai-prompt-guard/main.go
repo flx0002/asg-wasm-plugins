@@ -25,6 +25,7 @@ import (
 	"github.com/higress-group/wasm-go/pkg/log"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 const (
@@ -347,6 +348,10 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config PromptGuardConfig) ty
 		ctx.DontReadResponseBody()
 		return types.ActionContinue
 	}
+	// Response body may be rewritten by advisory injection, changing its length.
+	// Drop the upstream content-length here (headers not sent yet) so Envoy
+	// recomputes it; removing it in onHttpResponseBody is too late.
+	proxywasm.RemoveHttpResponseHeader("content-length")
 	return types.ActionContinue
 }
 
@@ -700,11 +705,13 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PromptGuardConfig, body 
 		for _, kw := range adv.keywords {
 			if strings.Contains(lower, kw) {
 				advised := appendAdvice(body, adv.advice)
-				if advised != nil {
-					log.Infof("Advisory rule [%s] applied to response", adv.name)
-					if err := proxywasm.ReplaceHttpResponseBody(advised); err != nil {
-						log.Warnf("replace response body failed: %v", err)
-					}
+				if advised == nil {
+					log.Warnf("advisory rule [%s] injection skipped: unexpected response body structure", adv.name)
+					return types.ActionContinue
+				}
+				log.Infof("Advisory rule [%s] applied to response", adv.name)
+				if err := proxywasm.ReplaceHttpResponseBody(advised); err != nil {
+					log.Warnf("replace response body failed: %v", err)
 				}
 				return types.ActionContinue
 			}
@@ -733,40 +740,22 @@ func extractResponseText(body []byte) string {
 }
 
 // appendAdvice rebuilds the response body with a safety note appended to the
-// first choice message content. Returns nil when the structure is not recognized
-// or when the content value appears more than once (ambiguous splice).
+// first choice message content. Returns nil when the structure is not recognized.
+// It uses sjson (structural Set) rather than byte-level string splicing, so it
+// works for both literal UTF-8 and \uXXXX-escaped response bodies regardless of
+// how the upstream serialized the JSON.
 func appendAdvice(body []byte, advice string) []byte {
 	path := "choices.0.message.content"
-	if !gjson.GetBytes(body, path).Exists() {
+	content := gjson.GetBytes(body, path)
+	if !content.Exists() {
 		return nil
 	}
-	// gjson cannot mutate; do a lightweight replacement of the content string.
-	original := gjson.GetBytes(body, path).String()
 	note := "\n\n【安全提示】" + advice
-	// Use encoding/json for correct escaping of the merged content.
-	merged, err := json.Marshal(original + note)
-	if err != nil {
+	out, err := sjson.SetBytes(body, path, content.String()+note)
+	if err != nil || !gjson.ValidBytes(out) {
 		return nil
 	}
-	// merged already carries surrounding quotes, matching jsonQuote's format
-	idx := strings.Index(string(body), jsonQuote(original))
-	if idx < 0 || strings.Contains(string(body)[idx+len(jsonQuote(original)):], jsonQuote(original)) {
-		return nil
-	}
-	out := make([]byte, 0, len(body)+len(note)+16)
-	out = append(out, body[:idx]...)
-	out = append(out, merged...)
-	rest := body[idx+len(jsonQuote(original)):]
-	out = append(out, rest...)
 	return out
-}
-
-func jsonQuote(s string) string {
-	b, err := json.Marshal(s)
-	if err != nil {
-		return ""
-	}
-	return string(b)
 }
 
 // matchesAnyCompiledRule checks if text matches any of the compiled rules
