@@ -428,7 +428,7 @@ func captureTokenUsageFromBody(rs *RequestState, body []byte) {
 }
 
 // PII 事件统一由 ai-pii-guard 写入 wasm.ai_log，再由 collectEventsFromAILog 搬运。
-// 旧路径从 x-pii-detected 响应头转录，字段大量缺失且严重度硬编码，已移除。
+// 旧路径从响应头转录（字段大量缺失、严重度硬编码）已整体移除。
 
 // extractRequestHeaders 从请求头提取 Agent 执行链信息
 func extractRequestHeaders(ctx wrapper.HttpContext) *RequestState {

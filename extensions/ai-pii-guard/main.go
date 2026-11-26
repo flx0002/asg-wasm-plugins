@@ -94,9 +94,6 @@ type PIIGuardConfig struct {
 	ReportToken string `json:"report_token"`
 }
 
-// piiContextKey for storing detection state across phases
-const piiCtxKey = "pii_guard_matched_rules"
-
 // DefaultPIIRules returns common PII patterns
 func DefaultPIIRules() []PIIRule {
 	return []PIIRule{
@@ -389,55 +386,22 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PIIGuardConfig, body []by
 	if len(hits) > 0 {
 		top := topSeverityHit(hits)
 		hasBlock := false
-		hasAlert := false
 		for _, h := range hits {
-			switch ruleAction(h) {
-			case "block":
+			if ruleAction(h) == "block" {
 				hasBlock = true
-			case "alert":
-				hasAlert = true
+				break
 			}
 		}
 		// IR-023: 外发告警上报 Console（fire-and-forget，不阻塞主链路）
-		status := "masked"
-		if hasBlock {
-			status = "blocked"
-		} else if hasAlert {
-			status = "alerted"
-		}
+		status := hitStatus(hits)
 		// 分类分级安全事件写入 wasm.ai_log，由 ai-agent-guard 原样搬运到内容安全事件。
-		// 命中片段只写脱敏占位符，绝不把原始敏感数据落到 ai_log / 审计库。
-		redacted := boundedText("["+top.Name+"_REDACTED]", maxMatchedRunes)
-		// 前端 detect_mode 只识别 deny / monitor；block 映射为拦截，其余（mask/alert）为不拦截。
-		detectMode := "monitor"
-		if hasBlock {
-			detectMode = "deny"
-		}
-		emitSecurityEvent(ctx, SecurityEvent{
-			Type:        eventTypeFor(ruleCategory(top)),
-			Severity:    ruleSeverity(top),
-			Source:      pluginName,
-			Score:       securityScore(ruleSeverity(top)),
-			Detail:      boundedText("Sensitive data detected in request: "+strings.Join(ruleNames(hits), ","), maxFieldRunes),
-			Direction:   "request",
-			HitContent:  boundedText(redacted, maxFieldRunes),
-			RuleName:    boundedText(strings.Join(ruleNames(hits), ","), maxFieldRunes),
-			RuleGroup:   ruleCategory(top),
-			MatchMethod: "regex",
-			MatchedText: redacted,
-			Reason:      boundedText("命中规则["+ruleCategory(top)+"]，匹配方式=regex，命中片段="+redacted+"；处理动作="+status, maxFieldRunes),
-			DetectMode:  detectMode,
-			Blocked:     hasBlock,
-			TimestampMs: time.Now().UnixMilli(),
-		})
+		emitPIIHit(ctx, hits, "request", status, hasBlock)
 		reportDlpEvent(ctx, config, top, status)
 		if hasBlock {
 			// secret 类命中即阻断（IR-023 验收口径：代码/密钥外发触发告警或阻断）
 			sendDenyResponse(403, "Sensitive data (secret) detected in request; blocked by ai-pii-guard")
 			return types.ActionContinue
 		}
-		// 上下文存储，供响应头阶段设置 x-pii-detected 头
-		ctx.SetContext(piiCtxKey, ruleNames(hits))
 	}
 
 	if changed {
@@ -450,10 +414,6 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PIIGuardConfig, body []by
 }
 
 func onHttpResponseHeaders(ctx wrapper.HttpContext, config PIIGuardConfig) types.Action {
-	// 从上下文读取请求阶段检测到的规则名，设置响应头供 ai-agent-guard 检测
-	if matchedRules, ok := ctx.GetContext(piiCtxKey).([]string); ok && len(matchedRules) > 0 {
-		_ = proxywasm.AddHttpResponseHeader("x-pii-detected", strings.Join(matchedRules, ","))
-	}
 	if !config.ProtectResponse {
 		ctx.DontReadResponseBody()
 	}
@@ -472,14 +432,16 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PIIGuardConfig, body []b
 	}
 
 	newBody := string(body)
+	var hits []PIIRule
 	for i, choice := range choices.Array() {
 		content := choice.Get("message.content").String()
 		if content == "" {
 			continue
 		}
 
-		// Mask PII in content
-		maskedContent, _ := maskPII(content, config.Rules, config.LogMatches)
+		// Mask PII in content，同时保留命中元数据用于审计事件
+		maskedContent, matched := processText(content, config.Rules, config.LogMatches)
+		hits = append(hits, matched...)
 		if maskedContent != content {
 			path := "choices." + itoa(i) + ".message.content"
 			var err error
@@ -488,6 +450,11 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PIIGuardConfig, body []b
 				log.Errorf("Failed to update response content: %v", err)
 			}
 		}
+	}
+
+	// 响应侧命中也要落内容安全事件（direction=response），与请求侧共用构造口径。
+	if len(hits) > 0 {
+		emitPIIHit(ctx, hits, "response", hitStatus(hits), false)
 	}
 
 	if newBody != string(body) {
@@ -663,6 +630,61 @@ func boundedText(s string, maxRunes int) string {
 		return s
 	}
 	return string(r[:maxRunes]) + "…"
+}
+
+// hitStatus 按命中规则的处理动作给出 status：block 优先，其次 alert，默认 masked。
+// 原本响应侧硬编码 masked 会让 alert/block 命中的 reason 与真实动作不符。
+func hitStatus(hits []PIIRule) string {
+	hasAlert := false
+	for _, h := range hits {
+		switch ruleAction(h) {
+		case "block":
+			return "blocked"
+		case "alert":
+			hasAlert = true
+		}
+	}
+	if hasAlert {
+		return "alerted"
+	}
+	return "masked"
+}
+
+// statusToDetectMode 让 detect_mode 与 reason 里的处理动作同一口径，
+// 前端 detectMode 映射已覆盖这三个值。
+func statusToDetectMode(status string) string {
+	switch status {
+	case "blocked":
+		return "block"
+	case "alerted":
+		return "alert"
+	default:
+		return "mask"
+	}
+}
+
+// emitPIIHit 是请求/响应两侧共用的事件构造函数：字段口径只保留一份，
+// 避免两侧漂移。命中片段只写脱敏占位符，绝不把原始敏感数据落到 ai_log / 审计库。
+func emitPIIHit(ctx wrapper.HttpContext, hits []PIIRule, direction, status string, blocked bool) {
+	top := topSeverityHit(hits)
+	redacted := boundedText("["+top.Name+"_REDACTED]", maxMatchedRunes)
+	emitSecurityEvent(ctx, SecurityEvent{
+		Type:        eventTypeFor(ruleCategory(top)),
+		Severity:    ruleSeverity(top),
+		Source:      pluginName,
+		Score:       securityScore(ruleSeverity(top)),
+		Detail:      boundedText("Sensitive data detected in "+direction+": "+strings.Join(ruleNames(hits), ","), maxFieldRunes),
+		Direction:   direction,
+		HitContent:  boundedText(redacted, maxFieldRunes),
+		RuleName:    boundedText(strings.Join(ruleNames(hits), ","), maxFieldRunes),
+		RuleGroup:   ruleCategory(top),
+		MatchMethod: "regex",
+		MatchedText: redacted,
+		Reason:      boundedText("命中规则["+ruleCategory(top)+"]，匹配方式=regex，命中片段="+redacted+"；处理动作="+status, maxFieldRunes),
+		DetectMode:  boundedText(statusToDetectMode(status), maxFieldRunes),
+		Blocked:     blocked,
+		TimestampMs: time.Now().UnixMilli(),
+	})
 }
 
 // emitSecurityEvent 把命中事件写入 wasm.ai_log 一级 filter state。
