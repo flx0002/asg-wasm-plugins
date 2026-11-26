@@ -255,71 +255,6 @@ func securityScore(sev string) int {
 	}
 }
 
-// defaultAllRules returns the IR-023 built-in rule set: PII masking + secret blocking + code alert.
-func defaultAllRules() []PIIRule {
-	rules := DefaultPIIRules()
-	rules = append(rules, DefaultSecretRules()...)
-	rules = append(rules, DefaultCodeRules()...)
-	return rules
-}
-
-// pageBuiltinRuleAliases maps console-page built-in rule names to the plugin's built-in
-// names. The page has saved these short names since its first version; without this map
-// a UI save produced zero usable rules.
-var pageBuiltinRuleAliases = map[string][]string{
-	"email":      []string{"email"},
-	"phone":      []string{"phone_cn", "phone_intl"},
-	"idcard":     []string{"id_card_cn"},
-	"creditcard": []string{"credit_card"},
-	"ssn":        []string{"ssn_us"},
-	"ipv4":       []string{"ipv4"},
-	// apikey resolves to a block rule: on match the request is denied, not masked.
-	"apikey": []string{"generic_secret_assignment"},
-}
-
-// rulesFromPageBuiltins resolves a page string-array rules list into built-in rule objects.
-// Secret and code rules are not exposed on the page, so they stay enabled to preserve
-// IR-023's default credential-blocking and code-alert protection.
-func rulesFromPageBuiltins(names []gjson.Result) []PIIRule {
-	selected := make(map[string]bool)
-	for _, name := range names {
-		for _, builtin := range pageBuiltinRuleAliases[name.String()] {
-			selected[builtin] = true
-		}
-	}
-	all := defaultAllRules()
-	rules := make([]PIIRule, 0, len(all))
-	for _, rule := range all {
-		if rule.Category != "pii" || selected[rule.Name] {
-			rules = append(rules, rule)
-		}
-	}
-	return rules
-}
-
-// rulesFromObjects parses the spec.yaml-conformant object-array rules.
-func rulesFromObjects(items []gjson.Result) []PIIRule {
-	rules := make([]PIIRule, 0, len(items))
-	for _, item := range items {
-		rule := PIIRule{
-			Name:        item.Get("name").String(),
-			Pattern:     item.Get("pattern").String(),
-			Replacement: item.Get("replacement").String(),
-			Category:    item.Get("category").String(),
-			Severity:    item.Get("severity").String(),
-			Action:      item.Get("action").String(),
-		}
-		if rule.Pattern == "" {
-			continue
-		}
-		if rule.Replacement == "" {
-			rule.Replacement = "[REDACTED]"
-		}
-		rules = append(rules, rule)
-	}
-	return rules
-}
-
 func parseConfig(json gjson.Result, config *PIIGuardConfig) error {
 	// Set defaults
 	config.ProtectRequest = true
@@ -353,45 +288,32 @@ func parseConfig(json gjson.Result, config *PIIGuardConfig) error {
 		config.ReportToken = v.String()
 	}
 
-	// Console page schema compatibility: the page saves checkRequest/checkResponse while
-	// spec.yaml defines protect_request/protect_response. Mirror ai-prompt-guard's approach.
-	if json.Get("checkRequest").Exists() {
-		config.ProtectRequest = json.Get("checkRequest").Bool()
-	}
-	if json.Get("checkResponse").Exists() {
-		config.ProtectResponse = json.Get("checkResponse").Bool()
-	}
-
-	// Parse rules: empty -> IR-023 defaults; string array -> page built-in names;
-	// object array -> spec.yaml custom rules.
+	// Parse rules
 	rulesJson := json.Get("rules").Array()
-	switch {
-	case len(rulesJson) == 0:
-		config.Rules = defaultAllRules()
-	case rulesJson[0].Type == gjson.String:
-		config.Rules = rulesFromPageBuiltins(rulesJson)
-	default:
-		config.Rules = rulesFromObjects(rulesJson)
-	}
-
-	// Console page custom rules (not covered by spec.yaml): name/regex/replaceValue.
-	for _, raw := range json.Get("customRules").Array() {
-		pattern := raw.Get("regex").String()
-		if pattern == "" {
-			continue
+	if len(rulesJson) == 0 {
+		// Use default rules: PII masking + secret blocking + code alerting (IR-023)
+		config.Rules = DefaultPIIRules()
+		config.Rules = append(config.Rules, DefaultSecretRules()...)
+		config.Rules = append(config.Rules, DefaultCodeRules()...)
+	} else {
+		config.Rules = make([]PIIRule, 0, len(rulesJson))
+		for _, ruleJson := range rulesJson {
+			rule := PIIRule{
+				Name:        ruleJson.Get("name").String(),
+				Pattern:     ruleJson.Get("pattern").String(),
+				Replacement: ruleJson.Get("replacement").String(),
+				Category:    ruleJson.Get("category").String(),
+				Severity:    ruleJson.Get("severity").String(),
+				Action:      ruleJson.Get("action").String(),
+			}
+			if rule.Pattern == "" {
+				continue
+			}
+			if rule.Replacement == "" {
+				rule.Replacement = "[REDACTED]"
+			}
+			config.Rules = append(config.Rules, rule)
 		}
-		replacement := raw.Get("replaceValue").String()
-		if replacement == "" {
-			replacement = "[REDACTED]"
-		}
-		config.Rules = append(config.Rules, PIIRule{
-			Name:        raw.Get("name").String(),
-			Pattern:     pattern,
-			Replacement: replacement,
-			Category:    "pii",
-			Severity:    "medium",
-			Action:      "mask",
-		})
 	}
 
 	// Compile patterns
