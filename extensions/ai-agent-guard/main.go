@@ -299,15 +299,13 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, cfg config.AgentGuardConfig)
 	// 降级模式：收集安全事件 + 注入模式标识 + 行为风险打分
 	if rs.Mode == ModeDegraded {
 		injectDownstreamModeHeader(ModeDegraded)
-		// 捕获响应状态码（供 onHttpResponseBody 中 inferSecurityEventsFromResponse 使用）
+		// 捕获响应状态码（供降级模式审计记录使用）
 		if statusStr, err := proxywasm.GetHttpResponseHeader(":status"); err == nil && statusStr != "" {
 			if code, err := strconv.Atoi(statusStr); err == nil {
 				rs.ResponseStatus = code
 			}
 		}
-		// 降级模式：从 ai-pii-guard 响应头收集 PII 事件（跨 VM 保底方案）
-		collectPIIEventsFromHeaders(rs)
-		// 降级模式仍收集安全事件（由上游安全插件写入 Dynamic Metadata）
+		// 降级模式仍收集安全事件（由上游安全插件写入 ai_log）
 		if len(rs.Events) == 0 {
 			rs.Events = collectSecurityEvents(rs)
 		}
@@ -319,12 +317,9 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, cfg config.AgentGuardConfig)
 	// 记录响应开始时间（用于计算 ResponseLatency）
 	rs.ResponseStartTime = time.Now().UnixMilli()
 
-	// 完整模式：从 ai-pii-guard 响应头收集 PII 事件（跨 VM 保底方案）
-	collectPIIEventsFromHeaders(rs)
-
-	// 完整模式：收集安全事件
+	// 完整模式：收集安全事件（含 ai-pii-guard 经 ai_log 传递的命中事件）
 	events := collectSecurityEvents(rs)
-	// 合并：如果 collectSecurityEvents 也返回了事件（Dynamic Metadata 可用），追加到已有事件
+	// 合并：ai_log 中可能有响应体阶段才产生的命中，追加到已有事件
 	if len(events) > 0 && len(rs.Events) > 0 {
 		rs.Events = append(rs.Events, events...)
 	} else if len(events) > 0 {
@@ -388,9 +383,6 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, cfg config.AgentGuardC
 			rs.Events = collectSecurityEvents(rs)
 		}
 
-		// 根据响应状态码推断安全事件
-		inferSecurityEventsFromResponse(rs)
-
 		// 在流结束时写入审计日志（此时 token 用量已捕获）
 		writeAuditLog(ctx, &cfg, rs)
 	}
@@ -409,8 +401,6 @@ func onHttpResponseBody(ctx wrapper.HttpContext, cfg config.AgentGuardConfig, bo
 	if len(rs.Events) == 0 {
 		rs.Events = collectSecurityEvents(rs)
 	}
-	// 根据响应状态码推断安全事件（Wasm 插件 Dynamic Metadata 不跨 VM 共享的兜底方案）
-	inferSecurityEventsFromResponse(rs)
 	// 非流式响应：从 JSON body 解析 token 用量并累加到 Session 配额
 	captureTokenUsageFromBody(rs, body)
 	incrementSessionTokens(&cfg, rs)
@@ -437,58 +427,8 @@ func captureTokenUsageFromBody(rs *RequestState, body []byte) {
 	}
 }
 
-// inferSecurityEventsFromResponse 只处理 ai-pii-guard 通过响应头传递的 PII 事件。
-// 提示注入事件一律来自 ai-prompt-guard 写入 ai_log 的真实命中；过去"403 即
-// prompt_injection"的反推会把影子AI / key-auth / 上游的 403 全部误报，已删除。
-func inferSecurityEventsFromResponse(rs *RequestState) {
-	// === PII 检测推断（通过 ai-pii-guard 设置的 x-pii-detected 响应头） ===
-	if piiHeader, err := proxywasm.GetHttpResponseHeader("x-pii-detected"); err == nil && piiHeader != "" {
-		if !hasEventType(rs.Events, "pii_leak") {
-			rs.Events = append(rs.Events, SecurityEvent{
-				Type:     "pii_leak",
-				Severity: "medium",
-				Source:   "ai-pii-guard",
-				Score:    60,
-				Detail:   "PII detected and masked in request: " + piiHeader,
-				Direction: "request",
-			})
-			log.Debugf("inferSecurityEventsFromResponse: inferred pii_leak event from x-pii-detected header: %s", piiHeader)
-		}
-	}
-}
-
-// hasEventType 检查事件列表中是否已包含指定类型的事件（避免重复添加）
-func hasEventType(events []SecurityEvent, eventType string) bool {
-	for _, e := range events {
-		if e.Type == eventType {
-			return true
-		}
-	}
-	return false
-}
-
-// collectPIIEventsFromHeaders 从 ai-pii-guard 设置的 x-pii-detected 响应头收集 PII 事件
-// 由于 Wasm VM 隔离，Dynamic Metadata 可能不跨插件共享。
-// ai-pii-guard 在 onHttpRequestBody 检测到 PII 后会暂存匹配规则，
-// 在 onHttpResponseHeaders 中设置 x-pii-detected 响应头供本插件读取。
-func collectPIIEventsFromHeaders(rs *RequestState) {
-	piiHeader, err := proxywasm.GetHttpResponseHeader("x-pii-detected")
-	if err != nil || piiHeader == "" {
-		return
-	}
-	if hasEventType(rs.Events, "pii_leak") {
-		return
-	}
-	rs.Events = append(rs.Events, SecurityEvent{
-		Type:     "pii_leak",
-		Severity: "medium",
-		Source:   "ai-pii-guard",
-		Score:    60,
-		Detail:   "PII detected and masked in request: " + piiHeader,
-		Direction: "request",
-	})
-	log.Debugf("collectPIIEventsFromHeaders: detected PII rules=%s from x-pii-detected header", piiHeader)
-}
+// PII 事件统一由 ai-pii-guard 写入 wasm.ai_log，再由 collectEventsFromAILog 搬运。
+// 旧路径从 x-pii-detected 响应头转录，字段大量缺失且严重度硬编码，已移除。
 
 // extractRequestHeaders 从请求头提取 Agent 执行链信息
 func extractRequestHeaders(ctx wrapper.HttpContext) *RequestState {

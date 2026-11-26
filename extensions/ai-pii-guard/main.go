@@ -31,6 +31,17 @@ import (
 
 const (
 	pluginName = "ai-pii-guard"
+
+	// pii_guard_event 写入 wasm.ai_log 一级 filter state（per-request 共享），
+	// 供 ai-agent-guard 读取；两级路径 security_events 属于插件私有 VM，跨插件不可见。
+	PIIGuardEventKey = "pii_guard_event"
+
+	// ai_log 会被 access log 模板打进单行 JSON，事件体必须有上界，
+	// 否则超长行会被采集器静默丢弃（与 ai-prompt-guard 同一口径）。
+	maxEmittedEvents   = 20
+	maxAIlogEventBytes = 8192
+	maxFieldRunes      = 512
+	maxMatchedRunes    = 128
 )
 
 func main() {}
@@ -387,14 +398,6 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PIIGuardConfig, body []by
 				hasAlert = true
 			}
 		}
-		// 分类分级安全事件写入 Dynamic Metadata，供 ai-agent-guard 收集并记录审计日志
-		appendSecurityEvent(SecurityEvent{
-			Type:     eventTypeFor(ruleCategory(top)),
-			Severity: ruleSeverity(top),
-			Source:   "ai-pii-guard",
-			Score:    securityScore(ruleSeverity(top)),
-			Detail:   "Sensitive data detected in request: " + strings.Join(ruleNames(hits), ","),
-		})
 		// IR-023: 外发告警上报 Console（fire-and-forget，不阻塞主链路）
 		status := "masked"
 		if hasBlock {
@@ -402,6 +405,31 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PIIGuardConfig, body []by
 		} else if hasAlert {
 			status = "alerted"
 		}
+		// 分类分级安全事件写入 wasm.ai_log，由 ai-agent-guard 原样搬运到内容安全事件。
+		// 命中片段只写脱敏占位符，绝不把原始敏感数据落到 ai_log / 审计库。
+		redacted := boundedText("["+top.Name+"_REDACTED]", maxMatchedRunes)
+		// 前端 detect_mode 只识别 deny / monitor；block 映射为拦截，其余（mask/alert）为不拦截。
+		detectMode := "monitor"
+		if hasBlock {
+			detectMode = "deny"
+		}
+		emitSecurityEvent(ctx, SecurityEvent{
+			Type:        eventTypeFor(ruleCategory(top)),
+			Severity:    ruleSeverity(top),
+			Source:      pluginName,
+			Score:       securityScore(ruleSeverity(top)),
+			Detail:      boundedText("Sensitive data detected in request: "+strings.Join(ruleNames(hits), ","), maxFieldRunes),
+			Direction:   "request",
+			HitContent:  boundedText(redacted, maxFieldRunes),
+			RuleName:    boundedText(strings.Join(ruleNames(hits), ","), maxFieldRunes),
+			RuleGroup:   ruleCategory(top),
+			MatchMethod: "regex",
+			MatchedText: redacted,
+			Reason:      boundedText("命中规则["+ruleCategory(top)+"]，匹配方式=regex，命中片段="+redacted+"；处理动作="+status, maxFieldRunes),
+			DetectMode:  detectMode,
+			Blocked:     hasBlock,
+			TimestampMs: time.Now().UnixMilli(),
+		})
 		reportDlpEvent(ctx, config, top, status)
 		if hasBlock {
 			// secret 类命中即阻断（IR-023 验收口径：代码/密钥外发触发告警或阻断）
@@ -611,27 +639,63 @@ func sendDenyResponse(statusCode uint32, message string) {
 
 // SecurityEvent 安全事件（与 ai-agent-guard 的 SecurityEvent 结构对齐）
 type SecurityEvent struct {
-	Type     string `json:"type"`
-	Severity string `json:"severity"`
-	Source   string `json:"source"`
-	Score    int    `json:"score"`
-	Detail   string `json:"detail"`
+	Type        string `json:"type"`
+	Severity    string `json:"severity"`
+	Source      string `json:"source"`
+	Score       int    `json:"score"`
+	Detail      string `json:"detail"`
+	Direction   string `json:"direction"`
+	HitContent  string `json:"hit_content"`
+	RuleName    string `json:"rule_name"`
+	RuleGroup   string `json:"rule_group"`
+	MatchMethod string `json:"match_method"`
+	MatchedText string `json:"matched_text"`
+	Reason      string `json:"reason"`
+	DetectMode  string `json:"detect_mode"`
+	Blocked     bool   `json:"blocked"`
+	TimestampMs int64  `json:"timestamp_ms"`
 }
 
-// appendSecurityEvent 向 Dynamic Metadata 追加安全事件，供 ai-agent-guard 收集并记录审计日志
-func appendSecurityEvent(event SecurityEvent) {
+// boundedText 按 rune 截断，避免超长规则名把 ai_log 单行撑爆（与 ai-prompt-guard 同一口径）。
+func boundedText(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "…"
+}
+
+// emitSecurityEvent 把命中事件写入 wasm.ai_log 一级 filter state。
+// 两级路径 security_events 属于插件私有 VM，ai-agent-guard 读不到；ai_log 是
+// per-request 共享状态，WriteUserAttributeToLogWithKey 会先读回已有 key 再 merge，
+// 因此不会覆盖 ai-prompt-guard / agent_guard_audit 等其它字段。
+func emitSecurityEvent(ctx wrapper.HttpContext, event SecurityEvent) {
 	var events []SecurityEvent
-	if existing, err := proxywasm.GetProperty([]string{"security_events", "events"}); err == nil && len(existing) > 0 {
-		_ = json.Unmarshal(existing, &events)
+	if existing, ok := ctx.GetUserAttribute(PIIGuardEventKey).(string); ok && existing != "" {
+		_ = json.Unmarshal([]byte(existing), &events)
+	}
+	if len(events) >= maxEmittedEvents {
+		log.Warnf("pii guard events exceed %d, drop new hit", maxEmittedEvents)
+		return
 	}
 	events = append(events, event)
 	data, err := json.Marshal(events)
 	if err != nil {
-		log.Warnf("marshal security events failed: %v", err)
+		log.Warnf("marshal pii security events failed: %v", err)
 		return
 	}
-	if err := proxywasm.SetProperty([]string{"security_events", "events"}, data); err != nil {
-		log.Warnf("set security_events metadata failed: %v", err)
+	// 整体字节上界：保留最新命中、丢弃最旧，防止超长 ai_log 被采集器静默丢弃。
+	for len(events) > 1 && len(data) > maxAIlogEventBytes {
+		events = events[1:]
+		data, err = json.Marshal(events)
+		if err != nil {
+			log.Warnf("marshal pii security events failed: %v", err)
+			return
+		}
+	}
+	ctx.SetUserAttribute(PIIGuardEventKey, string(data))
+	if err := ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey); err != nil {
+		log.Warnf("write %s to ai_log failed: %v", PIIGuardEventKey, err)
 	}
 }
 

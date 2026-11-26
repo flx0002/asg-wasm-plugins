@@ -11,17 +11,21 @@ import (
 	"github.com/tidwall/resp"
 )
 
-const PromptGuardEventKey = "prompt_guard_event"
+const (
+	PromptGuardEventKey = "prompt_guard_event"
+	PIIGuardEventKey    = "pii_guard_event"
+)
 
-// collectSecurityEvents 只从 wasm.ai_log 一级 filter state 读取 ai-prompt-guard
-// 写入的真实命中事件。两级路径 security_events 属于插件私有 VM，跨插件不可见；
-// 任何从 HTTP 状态码反推事件的做法都会把其它插件的 403 误报成提示注入，已移除。
+// collectSecurityEvents 从 wasm.ai_log 一级 filter state 读取安全插件写入的真实命中
+// 事件：ai-prompt-guard 的 prompt_guard_event 与 ai-pii-guard 的 pii_guard_event。
+// 两级路径 security_events 属于插件私有 VM，跨插件不可见；任何从 HTTP 状态码反推
+// 事件的做法都会把其它插件的 403 误报成提示注入，已移除。
 func collectSecurityEvents(rs *RequestState) []SecurityEvent {
 	return collectEventsFromAILog()
 }
 
 // collectEventsFromAILog 解码 ai_log（marshalStr 产物是去掉外层引号的 JSON 字符串
-// 字面量内容），取出 prompt_guard_event。该值由 ai-prompt-guard 以 JSON 字符串写入，
+// 字面量内容），取出两个安全插件各自写入的事件数组。值由插件以 JSON 字符串写入，
 // 兼容直接以数组写入的历史形态。
 func collectEventsFromAILog() []SecurityEvent {
 	raw, err := proxywasm.GetProperty([]string{wrapper.AILogKey})
@@ -37,7 +41,16 @@ func collectEventsFromAILog() []SecurityEvent {
 		log.Warnf("collectEventsFromAILog: unmarshal ai_log failed: %v", err)
 		return nil
 	}
-	v, ok := attr[PromptGuardEventKey]
+	var all []SecurityEvent
+	for _, key := range []string{PromptGuardEventKey, PIIGuardEventKey} {
+		all = append(all, decodeEventsFromAttr(attr, key)...)
+	}
+	return all
+}
+
+// decodeEventsFromAttr 从 ai_log 属性表中解码单个插件的事件数组。
+func decodeEventsFromAttr(attr map[string]json.RawMessage, key string) []SecurityEvent {
+	v, ok := attr[key]
 	if !ok || len(v) == 0 {
 		return nil
 	}
@@ -47,7 +60,7 @@ func collectEventsFromAILog() []SecurityEvent {
 	}
 	var events []SecurityEvent
 	if err := json.Unmarshal(v, &events); err != nil {
-		log.Warnf("collectEventsFromAILog: unmarshal prompt_guard_event failed: %v", err)
+		log.Warnf("decodeEventsFromAttr: unmarshal %s failed: %v", key, err)
 		return nil
 	}
 	return events
